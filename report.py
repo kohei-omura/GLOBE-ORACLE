@@ -32,11 +32,35 @@ DOCS.mkdir(exist_ok=True)
 
 WATCH_FALLBACK: list[str] = []  # クライアント側 localStorage 管理（サーバーは空でOK）
 
-# ── 保有銘柄（ここを編集）: code=ティッカー, shares=株数, avg=平均取得単価USD ──
-HOLDINGS: list[dict] = [
-    # {"code": "AAPL", "shares": 10, "avg": 180.0},
-    # {"code": "NVDA", "shares": 5,  "avg": 110.0},
-]
+HOLDINGS_FILE = Path("holdings.txt")
+
+
+def load_holdings() -> list[dict]:
+    """holdings.txt を読む。1行 = 「ティッカー,買値[,利確,損切]」。#はコメント。
+    例: SOFI,18.68  /  AAPL,180,210,165"""
+    out: list[dict] = []
+    if not HOLDINGS_FILE.exists():
+        return out
+    try:
+        for line in HOLDINGS_FILE.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = [p.strip() for p in s.replace("\t", ",").split(",") if p.strip() != ""]
+            if len(parts) < 2:
+                continue
+            try:
+                rec = {"code": _norm_ticker(parts[0]), "avg": float(parts[1])}
+                if len(parts) >= 3:
+                    rec["tgt"] = float(parts[2])
+                if len(parts) >= 4:
+                    rec["stp"] = float(parts[3])
+                out.append(rec)
+            except Exception:
+                print(f"[globe] holdings行を無視: {s}", file=sys.stderr)
+    except Exception as e:
+        print(f"[globe] holdings.txt読込失敗: {e}", file=sys.stderr)
+    return out
 
 # ─────────────────────────────────────────────
 #  ユニバース: S&P500 ＋ NASDAQ100（重複除去）
@@ -527,12 +551,25 @@ def _fund_adjust(a: Analysis, f: dict) -> None:
               "fair": fair, "fair_gap": fair_gap, "valuation": valuation}
 
 
-def analyze_all() -> tuple[list[Analysis], dict]:
+def analyze_all() -> tuple[list[Analysis], dict, list[dict]]:
+    holdings = load_holdings()
+    hold_codes = [h["code"] for h in holdings]
     uni = fetch_universe()
+    # 保有銘柄をユニバースに必ず合流（S&P500/NASDAQ100外でも表示・検索可能に）
+    have = {c for c, _, _ in uni}
+    for hc in hold_codes:
+        if hc not in have:
+            uni.append((hc, hc, ""))
+            have.add(hc)
     code_meta = {c: (n, s) for c, n, s in uni}
     codes = [c for c, _, _ in uni]
-    print(f"[globe] ユニバース {len(codes)} 銘柄を取得中…", file=sys.stderr)
+    print(f"[globe] ユニバース {len(codes)} 銘柄（保有{len(hold_codes)}含む）を取得中…", file=sys.stderr)
     frames = _download_batch(codes, "1y")
+    # 取得漏れの保有銘柄は個別リトライ
+    for hc in hold_codes:
+        if hc not in frames:
+            one = _download_batch([hc], "1y")
+            frames.update(one)
     print(f"[globe] 取得成功 {len(frames)} 銘柄", file=sys.stderr)
 
     analyses: list[Analysis] = []
@@ -559,20 +596,23 @@ def analyze_all() -> tuple[list[Analysis], dict]:
 
     # 上位30＋ウォッチ＋保有のみ info 取得
     top_codes = [a.code for a in analyses[:30]]
-    hold_codes = [h["code"] for h in HOLDINGS]
     fund_codes = list(dict.fromkeys(top_codes + WATCH_FALLBACK + hold_codes))
     funds = _fetch_fundamentals(fund_codes)
     bt_targets = set(top_codes) | set(hold_codes)
     for a in analyses:
         if a.code in funds:
             _fund_adjust(a, funds[a.code])
-            # バリア法勝率（上位＋保有のみ）
+            # 保有銘柄は取得した正式名で上書き
+            if not a.name or a.name == a.code:
+                nm = funds[a.code].get("name")
+                if nm:
+                    a.name = nm
             if a.code in bt_targets and a.tgt and a.stp and a.code in frames:
                 a.bt = barrier_stats(frames[a.code], a.price, a.tgt, a.stp)
 
     analyses.sort(key=lambda x: x.sc, reverse=True)
     meta = market_window()
-    return analyses, meta
+    return analyses, meta, holdings
 
 
 # ─────────────────────────────────────────────
@@ -1077,28 +1117,32 @@ def _holding_card(h: dict, amap: dict) -> str:
     a = amap.get(h.get("code"))
     if not a:
         return ""
-    shares = h.get("shares", 0) or 0
     avg = h.get("avg", 0) or 0
+    # 手動指定があれば利確/損切を上書き（無ければ自動計算値を使用）
+    if h.get("tgt"):
+        a.tgt = h["tgt"]
+    if h.get("stp"):
+        a.stp = h["stp"]
     pl_pct = round((a.price - avg) / avg * 100.0, 1) if avg else 0.0
-    pl_val = (a.price - avg) * shares
     cls = "up" if pl_pct >= 0 else "dn"
     pl = (f'<div class="pl {cls}">損益 {"+" if pl_pct>=0 else ""}{pl_pct}%'
-          f'（{"+" if pl_val>=0 else ""}{_usd(pl_val)}）'
-          f'<span class="hnote">{shares}株 @ 平均{_usd(avg)}</span></div>')
+          f'<span class="hnote">買値 {_usd(avg)} → 現値 {_usd(a.price)}</span></div>')
     base = _card(0, a, True).replace('<span class="rank">0</span>', '<span class="rank">保有</span>')
     return base[:-6] + pl + "</div>"
 
 
-def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float) -> tuple[str, dict]:
+def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
+                    holdings: list[dict] | None = None) -> tuple[str, dict]:
+    holdings = holdings or []
     buys = [a for a in analyses if a.g == "BUY"][:20]
     amap = {a.code: a for a in analyses}
     ver = datetime.now(tz=JST).strftime("%Y%m%d%H%M")
 
-    buy_cards = "".join(_card(i + 1, a, True) for i, a in enumerate(buys)) or '<p class="empty">本日は買いシグナルがありません。</p>'
-    hold_cards = "".join(_holding_card(h, amap) for h in HOLDINGS)
+    buy_cards = "".join(_card(i + 1, a, True) for i, a in enumerate(buys)) or '<p class="empty">本日は買いシグナル（スコア35以上）がありません。</p>'
+    hold_cards = "".join(_holding_card(h, amap) for h in holdings)
     hold_sec = _section("保有銘柄", "MY HOLDINGS", hold_cards) if hold_cards.strip() else ""
 
-    shown = [a.code for a in buys] + [h.get("code") for h in HOLDINGS]
+    shown = [a.code for a in buys] + [h.get("code") for h in holdings]
 
     idx_row = (
         '<div class="idx">'
@@ -1143,7 +1187,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float) -> tupl
   </section>
 
   {hold_sec}
-  {_section("買い候補 TOP20", "BUY SIGNALS", buy_cards)}
+  {_section("買いシグナル TOP20", "BUY SIGNALS ・ スコア35以上のみ", buy_cards)}
 
   <footer>
     データ源：yfinance（約15分遅延・欠損があり得ます）／スコアはテクニカル＋ファンダの独自複合値<br>
@@ -1168,13 +1212,13 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float) -> tupl
 
 def write_dashboard() -> Path:
     try:
-        analyses, meta = analyze_all()
+        analyses, meta, holdings = analyze_all()
     except Exception as e:
         print(f"[globe] analyze致命的失敗: {e}", file=sys.stderr)
         traceback.print_exc()
-        analyses, meta = [], market_window()
+        analyses, meta, holdings = [], market_window(), load_holdings()
     usdjpy = _fetch_usdjpy()
-    html, stocks = build_dashboard(analyses, meta, usdjpy)
+    html, stocks = build_dashboard(analyses, meta, usdjpy, holdings)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
     (DOCS / "app.js").write_text(APP_JS, encoding="utf-8")
     (DOCS / "stocks.json").write_text(json.dumps(stocks, ensure_ascii=False), encoding="utf-8")
