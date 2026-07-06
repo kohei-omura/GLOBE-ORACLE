@@ -32,6 +32,12 @@ DOCS.mkdir(exist_ok=True)
 
 WATCH_FALLBACK: list[str] = []  # クライアント側 localStorage 管理（サーバーは空でOK）
 
+# ── 保有銘柄（ここを編集）: code=ティッカー, shares=株数, avg=平均取得単価USD ──
+HOLDINGS: list[dict] = [
+    # {"code": "AAPL", "shares": 10, "avg": 180.0},
+    # {"code": "NVDA", "shares": 5,  "avg": 110.0},
+]
+
 # ─────────────────────────────────────────────
 #  ユニバース: S&P500 ＋ NASDAQ100（重複除去）
 # ─────────────────────────────────────────────
@@ -460,6 +466,8 @@ def _fetch_fundamentals(codes: list[str]) -> dict[str, dict]:
                 "div": info.get("dividendYield"),
                 "target_mean": info.get("targetMeanPrice"),
                 "reco": info.get("recommendationKey"),
+                "eps": info.get("trailingEps"),
+                "book": info.get("bookValue"),
                 "sector": info.get("sector"),
                 "name": info.get("shortName") or info.get("longName"),
             }
@@ -497,8 +505,26 @@ def _fund_adjust(a: Analysis, f: dict) -> None:
             tpct = round((tm - a.price) / a.price * 100.0, 1)
     except Exception:
         tpct = None
+    # 理論株価（3法ブレンド: PER18 / PBR2.5 / アナリスト目標 の中央値）→ 割安/割高判定
+    fair = fair_gap = valuation = None
+    cands = []
+    try:
+        eps, book = f.get("eps"), f.get("book")
+        if eps and eps > 0:
+            cands.append(eps * 18.0)
+        if book and book > 0:
+            cands.append(book * 2.5)
+        if tm and tm > 0:
+            cands.append(float(tm))
+        if cands and a.price:
+            fair = round(float(np.median(cands)), 2)
+            fair_gap = round((fair - a.price) / a.price * 100.0, 1)
+            valuation = "割安" if fair_gap >= 10 else ("割高" if fair_gap <= -10 else "適正")
+    except Exception:
+        pass
     a.fund = {"per": per, "pbr": pbr, "roe": roe, "div": div,
-              "target_mean": tm, "target_pct": tpct, "reco": f.get("reco")}
+              "target_mean": tm, "target_pct": tpct, "reco": f.get("reco"),
+              "fair": fair, "fair_gap": fair_gap, "valuation": valuation}
 
 
 def analyze_all() -> tuple[list[Analysis], dict]:
@@ -531,15 +557,17 @@ def analyze_all() -> tuple[list[Analysis], dict]:
 
     analyses.sort(key=lambda x: x.sc, reverse=True)
 
-    # 上位30＋ウォッチのみ info 取得
+    # 上位30＋ウォッチ＋保有のみ info 取得
     top_codes = [a.code for a in analyses[:30]]
-    fund_codes = list(dict.fromkeys(top_codes + WATCH_FALLBACK))
+    hold_codes = [h["code"] for h in HOLDINGS]
+    fund_codes = list(dict.fromkeys(top_codes + WATCH_FALLBACK + hold_codes))
     funds = _fetch_fundamentals(fund_codes)
+    bt_targets = set(top_codes) | set(hold_codes)
     for a in analyses:
         if a.code in funds:
             _fund_adjust(a, funds[a.code])
-            # バリア法勝率（上位のみ・軽量化）
-            if a.code in top_codes and a.tgt and a.stp:
+            # バリア法勝率（上位＋保有のみ）
+            if a.code in bt_targets and a.tgt and a.stp and a.code in frames:
                 a.bt = barrier_stats(frames[a.code], a.price, a.tgt, a.stp)
 
     analyses.sort(key=lambda x: x.sc, reverse=True)
@@ -608,6 +636,14 @@ def _card(rank: int, a: Analysis, show_levels: bool) -> str:
         cls = "up" if tp >= 0 else "dn"
         an = (f'<div class="analyst {cls}">プロ予想 {"+" if tp>=0 else ""}{tp:.0f}%'
               f'（目標 {_usd(a.fund.get("target_mean"))}）</div>')
+    # 理論株価（割安/割高）
+    fair = ""
+    if a.fund and a.fund.get("fair"):
+        val = a.fund["valuation"]
+        gap = a.fund["fair_gap"]
+        vcls = {"割安": "up", "割高": "dn", "適正": "hold"}.get(val, "hold")
+        fair = (f'<div class="fair {vcls}">理論株価 {_usd(a.fund["fair"])} → '
+                f'<b>{val}</b>（{"+" if gap>=0 else ""}{gap:.0f}%）</div>')
     # ファンダ
     fund = ""
     if a.fund:
@@ -645,7 +681,7 @@ def _card(rank: int, a: Analysis, show_levels: bool) -> str:
         f'<span class="name">{_esc(a.name)}</span>{seg_html}</div>{_badge(a.g)}</div>'
         f'<div class="row2"><span class="price" data-px="{_esc(a.code)}" data-usd="{a.price}">{_usd(a.price)}</span>'
         f'<span class="score {scls}">{"+" if a.sc>=0 else ""}{a.sc}</span>{_score_bar(a.sc)}</div>'
-        f'{levels}{an}{ez_html}{fund}{bt}{reasons}</div>'
+        f'{levels}{an}{fair}{ez_html}{fund}{bt}{reasons}</div>'
     )
 
 
@@ -717,6 +753,11 @@ border-radius:8px;padding:1px 6px;margin-left:6px}
 .lv.tgt{color:var(--up)}.lv.stp{color:var(--dn)}.lv.rr{color:var(--gold)}
 .analyst{margin-top:8px;font-size:12px;font-weight:800}
 .analyst.up{color:var(--up)}.analyst.dn{color:var(--dn)}
+.fair{margin-top:6px;font-size:12px;font-weight:700;color:var(--mut)}
+.fair.up b{color:var(--up)}.fair.dn b{color:var(--dn)}.fair.hold b{color:var(--gold)}
+.pl{margin-top:8px;font-size:13px;font-weight:800}
+.pl.up{color:var(--up)}.pl.dn{color:var(--dn)}
+.hnote{font-size:11px;color:var(--mut);margin-left:8px;font-weight:600}
 .ez{margin-top:8px;font-size:12px;font-weight:800;color:var(--fg);
 background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:10px;padding:7px 10px}
 .ez.hit{background:rgba(70,196,106,.16);border-color:rgba(70,196,106,.55)}
@@ -787,6 +828,7 @@ APP_JS = r"""
         (s.rr ? '<span class="lv rr">RR ' + s.rr + '</span>' : '') + '</div>';
     }
     var an = (s.tp != null) ? '<div class="analyst ' + (s.tp >= 0 ? 'up' : 'dn') + '">プロ予想 ' + (s.tp >= 0 ? '+' : '') + s.tp + '%</div>' : '';
+    var fair = (s.val) ? '<div class="fair ' + (s.val === '割安' ? 'up' : s.val === '割高' ? 'dn' : 'hold') + '">理論株価 <b>' + s.val + '</b>（' + (s.fg >= 0 ? '+' : '') + s.fg + '%）</div>' : '';
     var reasons = (s.r && s.r.length) ? '<div class="reasons">' + s.r.map(function (r) { return '<span class="chip">' + r + '</span>'; }).join('') + '</div>' : '';
     var rm = (mode === 'watch') ? '<button class="rm" data-rm="' + s.c + '">×</button>' : '';
     return '<div class="card"><div class="row1"><span class="rank">' + (s.rk || '-') + '</span>' +
@@ -794,7 +836,7 @@ APP_JS = r"""
       badge(s.g) + starBtn(s.c) + rm + '</div>' +
       '<div class="row2"><span class="price" data-px="' + s.c + '" data-usd="' + s.p + '">' + fmtMoney(s.p) + '</span>' +
       '<span class="score ' + scls + '">' + (s.sc >= 0 ? '+' : '') + s.sc + '</span>' + bar(s.sc) + '</div>' +
-      levels + an + reasons +
+      levels + an + fair + reasons +
       '<div class="reasons"><span class="chip">スコア順 ' + (s.rk || '-') + ' 位 / ' + TOTAL + ' 銘柄</span></div></div>';
   }
   function byCode(c) { if (!STOCKS) return null; var v = String(c).toLowerCase(); for (var i = 0; i < STOCKS.length; i++) { if (STOCKS[i].c.toLowerCase() === v) return STOCKS[i]; } return null; }
@@ -1021,23 +1063,42 @@ def _manifest() -> str:
 # ─────────────────────────────────────────────
 def _to_stock_json(a: Analysis, rank: int) -> dict:
     tp = a.fund.get("target_pct") if a.fund else None
+    val = a.fund.get("valuation") if a.fund else None
+    fg = a.fund.get("fair_gap") if a.fund else None
     return {
         "c": a.code, "n": a.name, "k": _search_key(a.name, a.code),
         "p": a.price, "sc": a.sc, "g": a.g, "m": _sector_short(a.sector),
-        "t": a.tgt, "st": a.stp, "rr": a.rr, "r": a.reasons, "tp": tp, "rk": rank,
+        "t": a.tgt, "st": a.stp, "rr": a.rr, "r": a.reasons, "tp": tp,
+        "val": val, "fg": fg, "rk": rank,
     }
 
 
+def _holding_card(h: dict, amap: dict) -> str:
+    a = amap.get(h.get("code"))
+    if not a:
+        return ""
+    shares = h.get("shares", 0) or 0
+    avg = h.get("avg", 0) or 0
+    pl_pct = round((a.price - avg) / avg * 100.0, 1) if avg else 0.0
+    pl_val = (a.price - avg) * shares
+    cls = "up" if pl_pct >= 0 else "dn"
+    pl = (f'<div class="pl {cls}">損益 {"+" if pl_pct>=0 else ""}{pl_pct}%'
+          f'（{"+" if pl_val>=0 else ""}{_usd(pl_val)}）'
+          f'<span class="hnote">{shares}株 @ 平均{_usd(avg)}</span></div>')
+    base = _card(0, a, True).replace('<span class="rank">0</span>', '<span class="rank">保有</span>')
+    return base[:-6] + pl + "</div>"
+
+
 def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float) -> tuple[str, dict]:
-    buys = [a for a in analyses if a.g == "BUY"][:15]
-    sells = [a for a in analyses if a.g == "SELL"][-8:]
+    buys = [a for a in analyses if a.g == "BUY"][:20]
+    amap = {a.code: a for a in analyses}
     ver = datetime.now(tz=JST).strftime("%Y%m%d%H%M")
 
     buy_cards = "".join(_card(i + 1, a, True) for i, a in enumerate(buys)) or '<p class="empty">本日は買いシグナルがありません。</p>'
-    sell_cards = "".join(_card(len(analyses) - len(sells) + i + 1, a, False) for i, a in enumerate(sells))
-    sell_sec = _section("売り警戒 TOP", "SELL WATCH", sell_cards) if sells else ""
+    hold_cards = "".join(_holding_card(h, amap) for h in HOLDINGS)
+    hold_sec = _section("保有銘柄", "MY HOLDINGS", hold_cards) if hold_cards.strip() else ""
 
-    shown = [a.code for a in buys] + [a.code for a in sells]
+    shown = [a.code for a in buys] + [h.get("code") for h in HOLDINGS]
 
     idx_row = (
         '<div class="idx">'
@@ -1081,8 +1142,8 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float) -> tupl
     <div id="results" class="cards"></div>
   </section>
 
-  {_section("買い候補 TOP", "BUY SIGNALS", buy_cards)}
-  {sell_sec}
+  {hold_sec}
+  {_section("買い候補 TOP20", "BUY SIGNALS", buy_cards)}
 
   <footer>
     データ源：yfinance（約15分遅延・欠損があり得ます）／スコアはテクニカル＋ファンダの独自複合値<br>
