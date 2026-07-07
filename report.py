@@ -25,6 +25,12 @@ except Exception:  # pragma: no cover
 import numpy as np
 import pandas as pd
 
+import io
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
+
 JST = timezone(timedelta(hours=9))
 ET = ZoneInfo("America/New_York") if ZoneInfo else timezone(timedelta(hours=-5))
 DOCS = Path("docs")
@@ -124,46 +130,60 @@ def _norm_ticker(t: str) -> str:
     return (t or "").strip().upper().replace(".", "-")
 
 
+UNIVERSE_REDUCED = {"reduced": False}  # フォールバック（縮小モード）フラグ
+
+
+def _read_wiki_tables(url: str):
+    """UA付きrequestsでWikipediaを取得しread_html。403回避・リトライ2回。"""
+    headers = {"User-Agent": "Mozilla/5.0 (GLOBE-ORACLE bot)"}
+    for attempt in range(2):
+        try:
+            if requests is not None:
+                r = requests.get(url, headers=headers, timeout=30)
+                r.raise_for_status()
+                return pd.read_html(io.StringIO(r.text))
+            return pd.read_html(url)  # requests無ければ直叩き
+        except Exception as e:
+            if attempt == 1:
+                print(f"[globe] wiki取得失敗 {url}: {e}", file=sys.stderr)
+    return []
+
+
 def fetch_universe() -> list[tuple[str, str, str]]:
-    """S&P500＋NASDAQ100をWikipediaから取得。失敗時は内蔵フォールバック。
+    """S&P500＋NASDAQ100をWikipedia(UA付き)から取得。失敗時は内蔵フォールバック。
     戻り値: [(ticker, name, sector), ...]（重複除去）。"""
     rows: dict[str, tuple[str, str, str]] = {}
     # S&P 500
-    try:
-        tbls = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        df = tbls[0]
-        for _, r in df.iterrows():
-            tk = _norm_ticker(str(r.get("Symbol", "")))
-            nm = str(r.get("Security", tk)).strip()
-            sec = str(r.get("GICS Sector", "")).strip()
-            if tk:
-                rows[tk] = (tk, nm, sec)
-    except Exception as e:
-        print(f"[globe] S&P500取得失敗: {e}", file=sys.stderr)
+    for df in _read_wiki_tables("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"):
+        if "Symbol" in df.columns and "Security" in df.columns:
+            for _, r in df.iterrows():
+                tk = _norm_ticker(str(r.get("Symbol", "")))
+                nm = str(r.get("Security", tk)).strip()
+                sec = str(r.get("GICS Sector", "")).strip()
+                if tk:
+                    rows[tk] = (tk, nm, sec)
+            break
     # NASDAQ-100
-    try:
-        tbls = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
-        cand = None
-        for t in tbls:
-            cols = [str(c) for c in t.columns]
-            if any("Ticker" in c or "Symbol" in c for c in cols) and any("Company" in c or "Name" in c for c in cols):
-                cand = t
-                break
-        if cand is not None:
-            tcol = "Ticker" if "Ticker" in cand.columns else ("Symbol" if "Symbol" in cand.columns else cand.columns[0])
-            ncol = "Company" if "Company" in cand.columns else ("Name" if "Name" in cand.columns else cand.columns[1])
-            for _, r in cand.iterrows():
+    for t in _read_wiki_tables("https://en.wikipedia.org/wiki/Nasdaq-100"):
+        cols = [str(c) for c in t.columns]
+        if any("Ticker" in c or "Symbol" in c for c in cols) and any("Company" in c or "Name" in c for c in cols):
+            tcol = "Ticker" if "Ticker" in t.columns else ("Symbol" if "Symbol" in t.columns else t.columns[0])
+            ncol = "Company" if "Company" in t.columns else ("Name" if "Name" in t.columns else t.columns[1])
+            for _, r in t.iterrows():
                 tk = _norm_ticker(str(r.get(tcol, "")))
                 nm = str(r.get(ncol, tk)).strip()
                 if tk and tk not in rows:
                     rows[tk] = (tk, nm, "")
-    except Exception as e:
-        print(f"[globe] NASDAQ100取得失敗: {e}", file=sys.stderr)
+            break
 
-    if len(rows) < 50:
-        print("[globe] ユニバース取得不足→内蔵フォールバックを使用", file=sys.stderr)
+    n_wiki = len(rows)
+    used_fallback = False
+    if n_wiki < 100:
+        used_fallback = True
         for tk, nm, sec in FALLBACK_UNIVERSE:
             rows.setdefault(tk, (tk, nm, sec))
+    UNIVERSE_REDUCED["reduced"] = used_fallback
+    print(f"universe: wikipedia={n_wiki} fallback={used_fallback} total={len(rows)}", file=sys.stderr)
     return list(rows.values())
 
 
@@ -190,37 +210,47 @@ def _et_now() -> datetime:
     return datetime.now(tz=ET)
 
 
+def _is_trading_day(d: date) -> bool:
+    return d.weekday() < 5 and d not in US_HOLIDAYS
+
+
+def _session(d: date):
+    half = d in US_HALF_DAYS
+    o = datetime.combine(d, dtime(9, 30), tzinfo=ET)
+    c = datetime.combine(d, dtime(13, 0) if half else dtime(16, 0), tzinfo=ET)
+    return o, c, half
+
+
 def market_window() -> dict:
-    """当日のNY立会をJSTのポーリング窓(epoch ms)として返す。
-    DSTはzoneinfoが自動処理。半日立会は13:00 ET終了。"""
+    """現在のETを基準に「アクティブな窓（開場前/開場中）」または閉場後は
+    「次営業日の窓」を返す。market_openは now が窓内かで判定。半日は13:00 ET終了。"""
     now_et = _et_now()
     today = now_et.date()
-    is_weekend = today.weekday() >= 5
-    is_holiday = today in US_HOLIDAYS
-    half = today in US_HALF_DAYS
-    market_open = not (is_weekend or is_holiday)
-    open_et = datetime.combine(today, dtime(9, 30), tzinfo=ET)
-    close_et = datetime.combine(today, dtime(13, 0) if half else dtime(16, 0), tzinfo=ET)
-    open_ms = int(open_et.timestamp() * 1000)
-    close_ms = int(close_et.timestamp() * 1000)
-    # 次回開場（表示用）: 当日開場前ならその日、そうでなければ翌営業日
-    nxt = open_et
-    if (not market_open) or now_et >= close_et:
+    use_day = None
+    if _is_trading_day(today):
+        _o, _c, _ = _session(today)
+        if now_et < _c:          # 当日の引け前（＝開場前 or 開場中）
+            use_day = today
+    if use_day is None:          # 引け後 or 非営業日 → 次営業日
         d = today
         while True:
             d = d + timedelta(days=1)
-            if d.weekday() < 5 and d not in US_HOLIDAYS:
+            if _is_trading_day(d):
+                use_day = d
                 break
-        nxt = datetime.combine(d, dtime(9, 30), tzinfo=ET)
-    nxt_jst = nxt.astimezone(JST)
-    nxt_close = (nxt + timedelta(hours=(3.5 if nxt.date() in US_HALF_DAYS else 6.5))).astimezone(JST)
+    o, c, half = _session(use_day)
+    now_ms = int(now_et.timestamp() * 1000)
+    open_ms = int(o.timestamp() * 1000)
+    close_ms = int(c.timestamp() * 1000)
+    market_open = open_ms <= now_ms < close_ms
+    o_jst, c_jst = o.astimezone(JST), c.astimezone(JST)
     return {
         "market_open": market_open,
         "half_day": half,
         "open_ms": open_ms,
         "close_ms": close_ms,
-        "next_open_jst": nxt_jst.strftime("%m/%d %H:%M"),
-        "next_close_jst": nxt_close.strftime("%H:%M"),
+        "next_open_jst": o_jst.strftime("%m/%d %H:%M"),
+        "next_close_jst": c_jst.strftime("%H:%M"),
         "asof_jst": now_et.astimezone(JST).strftime("%Y-%m-%d %H:%M"),
     }
 
@@ -1005,9 +1035,12 @@ APP_JS = r"""
     var open = setMktStatus();
     if (open) { refreshPrices(); setTimeout(tick, 5 * 60 * 1000); }
     else {
+      // 閉場中でも60分毎に更新（窓の再取得＝翌営業日窓へ自動追従・デッドロック回避）
+      refreshPrices();
       var now = Date.now(), wait;
-      if (MKT.open_ms && now < MKT.open_ms) wait = MKT.open_ms - now; else wait = 6 * 3600 * 1000;
-      setTimeout(tick, Math.max(60000, Math.min(wait, 6 * 3600 * 1000)));
+      if (MKT.open_ms && now < MKT.open_ms) wait = Math.min(MKT.open_ms - now, 60 * 60 * 1000);
+      else wait = 60 * 60 * 1000;
+      setTimeout(tick, Math.max(60000, wait));
     }
   }
 
@@ -1114,11 +1147,16 @@ def _to_stock_json(a: Analysis, rank: int) -> dict:
 
 
 def _holding_card(h: dict, amap: dict) -> str:
-    a = amap.get(h.get("code"))
-    if not a:
-        return ""
+    code = h.get("code")
+    a = amap.get(code)
     avg = h.get("avg", 0) or 0
-    # 手動指定があれば利確/損切を上書き（無ければ自動計算値を使用）
+    if not a:
+        # データ取得不可でも保有として必ず表示（サイレント脱落させない）
+        return (f'<div class="card"><div class="row1"><span class="rank">保有</span>'
+                f'<div class="title"><span class="code">{_esc(code)}</span>'
+                f'<span class="name">買値 {_usd(avg)}</span></div>'
+                f'<span class="badge hold">?</span></div>'
+                f'<div class="pl dn">⚠ データ取得不可（ティッカー確認 or 一時的な取得失敗）</div></div>')
     if h.get("tgt"):
         a.tgt = h["tgt"]
     if h.get("stp"):
@@ -1140,7 +1178,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
 
     buy_cards = "".join(_card(i + 1, a, True) for i, a in enumerate(buys)) or '<p class="empty">本日は買いシグナル（スコア35以上）がありません。</p>'
     hold_cards = "".join(_holding_card(h, amap) for h in holdings)
-    hold_sec = _section("保有銘柄", "MY HOLDINGS", hold_cards) if hold_cards.strip() else ""
+    hold_sec = _section("💼 保有銘柄", "MY HOLDINGS", hold_cards) if holdings else ""
 
     shown = [a.code for a in buys] + [h.get("code") for h in holdings]
 
@@ -1182,12 +1220,12 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
   <section id="search-sec" class="sec">
     <div class="searchbar"><input id="q" type="text" inputmode="search"
       placeholder="🔍 銘柄検索（例: apple / NVDA / micro）" autocomplete="off"></div>
-    <p id="hint">社名（apple）またはティッカー（AAPL）で全{len(analyses)}銘柄を検索。⭐でウォッチ登録。</p>
+    <p id="hint">社名（apple）またはティッカー（AAPL）で全{len(analyses)}銘柄を検索。⭐でウォッチ登録。{'<br><span style="color:var(--dn)">⚠ 縮小モード：ユニバース取得に失敗し内蔵リストで動作中（銘柄数が少なめ）</span>' if UNIVERSE_REDUCED.get('reduced') else ''}</p>
     <div id="results" class="cards"></div>
   </section>
 
-  {hold_sec}
   {_section("買いシグナル TOP20", "BUY SIGNALS ・ スコア35以上のみ", buy_cards)}
+  {hold_sec}
 
   <footer>
     データ源：yfinance（約15分遅延・欠損があり得ます）／スコアはテクニカル＋ファンダの独自複合値<br>
