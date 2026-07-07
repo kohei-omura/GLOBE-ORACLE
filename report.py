@@ -131,6 +131,17 @@ def _norm_ticker(t: str) -> str:
 
 
 UNIVERSE_REDUCED = {"reduced": False}  # フォールバック（縮小モード）フラグ
+SP500_SET: set[str] = set()            # 現S&P500構成銘柄（候補レーダーの除外用）
+POOL_REDUCED = {"reduced": False}      # 候補プール縮小モードフラグ
+
+# 候補レーダー定数
+SP500_MCAP_MIN = 22_700_000_000        # S&P採用の時価総額目安 $22.7B（改定するため定数化）
+SCREEN_MCAP_MIN = 15_000_000_000       # スクリーナー候補プールの下限 $15B
+CANDIDATES_FILE = DOCS / "candidates.json"
+CANDIDATE_SEED = [  # スクリーナー失敗時のフォールバック（SOFI級の準大型・成長株）
+    "SOFI", "RDDT", "ALNY", "PSTG", "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR",
+    "HOOD", "DKNG", "TOST", "CELH", "SNOW",
+]
 
 
 def _read_wiki_tables(url: str):
@@ -162,6 +173,7 @@ def fetch_universe() -> list[tuple[str, str, str]]:
                 sec = str(r.get("GICS Sector", "")).strip()
                 if tk:
                     rows[tk] = (tk, nm, sec)
+                    SP500_SET.add(tk)
             break
     # NASDAQ-100
     for t in _read_wiki_tables("https://en.wikipedia.org/wiki/Nasdaq-100"):
@@ -581,7 +593,125 @@ def _fund_adjust(a: Analysis, f: dict) -> None:
               "fair": fair, "fair_gap": fair_gap, "valuation": valuation}
 
 
-def analyze_all() -> tuple[list[Analysis], dict, list[dict]]:
+def _extract_quotes(res) -> list:
+    if not res:
+        return []
+    if isinstance(res, list):
+        return res
+    if isinstance(res, dict):
+        if isinstance(res.get("quotes"), list):
+            return res["quotes"]
+        fin = res.get("finance") or {}
+        result = fin.get("result") or []
+        if result and isinstance(result, list):
+            return result[0].get("quotes", []) or []
+    return []
+
+
+def _screen_pool() -> list[dict]:
+    """yf.screenで米国・時価総額$15B以上を降順最大500件。失敗時はシードにフォールバック。"""
+    import yfinance as yf
+    pool: list[dict] = []
+    try:
+        q = yf.EquityQuery("and", [
+            yf.EquityQuery("gt", ["intradaymarketcap", SCREEN_MCAP_MIN]),
+            yf.EquityQuery("eq", ["region", "us"]),
+        ])
+        seen: set[str] = set()
+        for off in (0, 250):
+            res = yf.screen(q, size=250, offset=off, sortField="intradaymarketcap", sortAsc=False)
+            quotes = _extract_quotes(res)
+            for qt in quotes:
+                c = _norm_ticker(str(qt.get("symbol", "")))
+                if not c or c in seen:
+                    continue
+                seen.add(c)
+                pool.append({
+                    "c": c,
+                    "n": qt.get("shortName") or qt.get("longName") or c,
+                    "mcap": qt.get("marketCap") or 0,
+                    "qtype": str(qt.get("quoteType") or "").upper(),
+                    "exch": qt.get("exchange") or qt.get("fullExchangeName") or "",
+                })
+            if len(quotes) < 250:
+                break
+    except Exception as e:
+        print(f"[globe] yf.screen失敗: {e}", file=sys.stderr)
+    if len(pool) < 20:
+        POOL_REDUCED["reduced"] = True
+        pool = [{"c": c, "n": c, "mcap": 0, "qtype": "EQUITY", "exch": ""} for c in CANDIDATE_SEED]
+    else:
+        POOL_REDUCED["reduced"] = False
+    print(f"candidate pool: {len(pool)} reduced={POOL_REDUCED['reduced']}", file=sys.stderr)
+    return pool
+
+
+def _eval_criteria(code: str, mcap_hint: float) -> tuple[dict, float, str]:
+    """5基準チェックを判定。返り値: (crit, mcap, name)。"""
+    import yfinance as yf
+    import time as _t
+    crit = {"mc": False, "ttm": False, "q": False, "us": False, "age": False}
+    mcap = mcap_hint or 0
+    name = code
+    try:
+        tk = yf.Ticker(code)
+        info = tk.info or {}
+        mcap = info.get("marketCap") or mcap
+        name = info.get("shortName") or info.get("longName") or code
+        crit["mc"] = bool(mcap and mcap >= SP500_MCAP_MIN)
+        nitc = info.get("netIncomeToCommon")
+        crit["ttm"] = bool(nitc and nitc > 0)
+        crit["us"] = info.get("country") == "United States"
+        ftd = info.get("firstTradeDateEpochUtc")
+        if ftd:
+            crit["age"] = (_t.time() - float(ftd)) >= 365 * 24 * 3600
+        try:
+            qis = tk.quarterly_income_stmt
+            if qis is not None and not qis.empty:
+                for key in ("Net Income", "NetIncome", "Net Income Common Stockholders"):
+                    if key in qis.index:
+                        val = qis.loc[key].dropna()
+                        if len(val):
+                            crit["q"] = float(val.iloc[0]) > 0
+                        break
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[globe] 候補info失敗 {code}: {e}", file=sys.stderr)
+    return crit, mcap, name
+
+
+def screen_candidates() -> tuple[list[dict], dict]:
+    """S&P500入り候補レーダー。プール取得→現構成除外→上位60判定→スコア上位10。"""
+    pool = _screen_pool()
+    filt = [p for p in pool if p["c"] not in SP500_SET and p.get("qtype", "") in ("", "EQUITY")]
+    filt.sort(key=lambda x: x.get("mcap") or 0, reverse=True)
+    top = filt[:60]  # info呼び出しは最大60銘柄に制限（節約）
+    cands: list[dict] = []
+    for p in top:
+        crit, mcap, name = _eval_criteria(p["c"], p.get("mcap") or 0)
+        met = sum(1 for v in crit.values() if v)
+        headroom = (mcap / SP500_MCAP_MIN) if (SP500_MCAP_MIN and mcap) else 0.0
+        score = round(met + min(headroom, 3.0) * 0.1, 3)
+        cands.append({"c": p["c"], "n": name, "mcap": mcap, "crit": crit,
+                      "met": met, "score": score})
+    cands.sort(key=lambda x: x["score"], reverse=True)
+    cands = cands[:10]
+    prev_codes: set[str] = set()
+    try:
+        if CANDIDATES_FILE.exists():
+            prev = json.loads(CANDIDATES_FILE.read_text(encoding="utf-8"))
+            prev_codes = {x["c"] for x in prev.get("list", [])}
+    except Exception:
+        pass
+    for x in cands:
+        x["status"] = "NEW" if x["c"] not in prev_codes else "OK"
+    meta = {"asof": datetime.now(tz=JST).strftime("%Y-%m-%d %H:%M"),
+            "threshold": SP500_MCAP_MIN, "reduced": POOL_REDUCED["reduced"]}
+    return cands, meta
+
+
+def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict]:
     holdings = load_holdings()
     hold_codes = [h["code"] for h in holdings]
     uni = fetch_universe()
@@ -641,8 +771,38 @@ def analyze_all() -> tuple[list[Analysis], dict, list[dict]]:
                 a.bt = barrier_stats(frames[a.code], a.price, a.tgt, a.stp)
 
     analyses.sort(key=lambda x: x.sc, reverse=True)
+
+    # ── 2-E: S&P500入り候補レーダー ──
+    cands, cmeta = screen_candidates()
+    cand_codes = [x["c"] for x in cands]
+    have = {a.code for a in analyses}
+    missing = [c for c in cand_codes if c not in have]
+    if missing:
+        cframes = _download_batch(missing, "1y")
+        for c in missing:
+            df = cframes.get(c)
+            if df is None:
+                one = _download_batch([c], "1y")
+                df = one.get(c)
+            if df is None or df["Close"].dropna().shape[0] < 60:
+                continue
+            try:
+                price = float(df["Close"].dropna().iloc[-1])
+                sc, reasons, lv = technical_score(df)
+                nm = next((x["n"] for x in cands if x["c"] == c), c)
+                a = Analysis(c, nm, "", round(price, 2))
+                a.sc = sc
+                a.g = signal_of(sc)
+                a.reasons = reasons
+                if lv:
+                    a.tgt, a.stp, a.rr, a.ez = lv["tgt"], lv["stp"], lv["rr"], lv["ez"]
+                analyses.append(a)
+            except Exception as e:
+                print(f"[globe] 候補分析失敗 {c}: {e}", file=sys.stderr)
+
+    analyses.sort(key=lambda x: x.sc, reverse=True)
     meta = market_window()
-    return analyses, meta, holdings
+    return analyses, meta, holdings, cands, cmeta
 
 
 # ─────────────────────────────────────────────
@@ -760,6 +920,38 @@ def _section(title: str, sub: str, cards_html: str) -> str:
             f'<div class="cards">{cards_html}</div></section>')
 
 
+def _candidate_card(x: dict, amap: dict) -> str:
+    a = amap.get(x["c"])
+    crit = x["crit"]
+    checks = "".join("✅" if crit.get(k) else "❌" for k in ("mc", "ttm", "q", "us", "age"))
+    tech = _badge(a.g) if a else '<span class="badge hold">?</span>'
+    newb = '<span class="badge buy">NEW</span>' if x.get("status") == "NEW" else ""
+    mcap_b = f"${x['mcap']/1e9:.1f}B" if x.get("mcap") else "—"
+    px = (f'<span class="price" data-px="{_esc(x["c"])}" data-usd="{a.price}">{_usd(a.price)}</span>'
+          if a else '<span class="price">—</span>')
+    return (
+        f'<div class="card"><div class="row1">'
+        f'<div class="title"><span class="code">{_esc(x["c"])}</span>'
+        f'<span class="name">{_esc(x["n"])}</span></div>{newb}{tech}</div>'
+        f'<div class="row2">{px}'
+        f'<span class="seg">時価総額 {mcap_b}</span>'
+        f'<span class="chip">基準 {checks} ({x["met"]}/5)</span></div></div>'
+    )
+
+
+def _candidate_section(cands: list[dict], cmeta: dict, amap: dict) -> str:
+    if not cands:
+        return ""
+    cards = "".join(_candidate_card(x, amap) for x in cands)
+    reduced = '<span style="color:var(--dn)">⚠ 候補プール縮小モード</span> ' if cmeta.get("reduced") else ""
+    thr = SP500_MCAP_MIN / 1e9
+    foot = (f'<p class="cfoot">{reduced}S&amp;P公式基準（時価総額 ${thr:.1f}B・GAAP黒字等）による自動判定です。'
+            f'採用は委員会の裁量であり、本表示は採用を保証するものではありません。次回リバランス：毎四半期第3金曜。'
+            f'<br>判定閾値 ${thr:.1f}B ／ 判定日時 {_esc(cmeta.get("asof",""))} JST</p>')
+    return (f'<section class="sec"><h2 class="find"><span>🎯 S&amp;P500入り候補レーダー</span>'
+            f'<em>毎日自動判定</em></h2><div class="cards">{cards}</div>{foot}</section>')
+
+
 CSS_STR = r"""
 :root{--bg:#0a0f1e;--bg2:#0f1730;--card:#111c38;--line:rgba(255,255,255,.08);
 --fg:#eaf0ff;--mut:#8ea3c8;--gold:#e8c96a;--gold2:#caa64c;
@@ -828,6 +1020,7 @@ border-radius:8px;padding:1px 6px;margin-left:6px}
 .pl{margin-top:8px;font-size:13px;font-weight:800}
 .pl.up{color:var(--up)}.pl.dn{color:var(--dn)}
 .hnote{font-size:11px;color:var(--mut);margin-left:8px;font-weight:600}
+.cfoot{font-size:11px;color:var(--mut);line-height:1.7;margin:10px 2px 0;padding:8px 10px;background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:10px}
 .ez{margin-top:8px;font-size:12px;font-weight:800;color:var(--fg);
 background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:10px;padding:7px 10px}
 .ez.hit{background:rgba(70,196,106,.16);border-color:rgba(70,196,106,.55)}
@@ -1170,8 +1363,12 @@ def _holding_card(h: dict, amap: dict) -> str:
 
 
 def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
-                    holdings: list[dict] | None = None) -> tuple[str, dict]:
+                    holdings: list[dict] | None = None,
+                    cands: list[dict] | None = None,
+                    cmeta: dict | None = None) -> tuple[str, dict]:
     holdings = holdings or []
+    cands = cands or []
+    cmeta = cmeta or {}
     buys = [a for a in analyses if a.g == "BUY"][:20]
     amap = {a.code: a for a in analyses}
     ver = datetime.now(tz=JST).strftime("%Y%m%d%H%M")
@@ -1179,6 +1376,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
     buy_cards = "".join(_card(i + 1, a, True) for i, a in enumerate(buys)) or '<p class="empty">本日は買いシグナル（スコア35以上）がありません。</p>'
     hold_cards = "".join(_holding_card(h, amap) for h in holdings)
     hold_sec = _section("💼 保有銘柄", "MY HOLDINGS", hold_cards) if holdings else ""
+    cand_sec = _candidate_section(cands, cmeta, amap)
 
     shown = [a.code for a in buys] + [h.get("code") for h in holdings]
 
@@ -1217,6 +1415,8 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
     {idx_row}
   </header>
 
+  {cand_sec}
+
   <section id="search-sec" class="sec">
     <div class="searchbar"><input id="q" type="text" inputmode="search"
       placeholder="🔍 銘柄検索（例: apple / NVDA / micro）" autocomplete="off"></div>
@@ -1250,16 +1450,22 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
 
 def write_dashboard() -> Path:
     try:
-        analyses, meta, holdings = analyze_all()
+        analyses, meta, holdings, cands, cmeta = analyze_all()
     except Exception as e:
         print(f"[globe] analyze致命的失敗: {e}", file=sys.stderr)
         traceback.print_exc()
-        analyses, meta, holdings = [], market_window(), load_holdings()
+        analyses, meta, holdings, cands, cmeta = [], market_window(), load_holdings(), [], {}
     usdjpy = _fetch_usdjpy()
-    html, stocks = build_dashboard(analyses, meta, usdjpy, holdings)
+    html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
     (DOCS / "app.js").write_text(APP_JS, encoding="utf-8")
     (DOCS / "stocks.json").write_text(json.dumps(stocks, ensure_ascii=False), encoding="utf-8")
+    # 候補レーダー: candidates.json（NEW差分は screen_candidates で付与済み）
+    cand_out = {"asof": cmeta.get("asof"), "threshold": cmeta.get("threshold", SP500_MCAP_MIN),
+                "reduced": cmeta.get("reduced", False),
+                "list": [{"c": x["c"], "n": x["n"], "mcap": x["mcap"], "crit": x["crit"],
+                          "score": x["score"], "status": x.get("status", "OK")} for x in cands]}
+    (CANDIDATES_FILE).write_text(json.dumps(cand_out, ensure_ascii=False), encoding="utf-8")
     (DOCS / "manifest.json").write_text(_manifest(), encoding="utf-8")
     _gen_icons()
     # 初回 prices も生成（開場前でも指数を出す）

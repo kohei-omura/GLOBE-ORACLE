@@ -1,4 +1,4 @@
-yfinance>=0.2.40
+yfinance>=0.2.54  # yf.screen(EquityQuery) 対応
 pandas>=2.0
 numpy>=1.24
 lxml>=4.9
