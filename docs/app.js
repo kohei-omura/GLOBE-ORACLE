@@ -191,9 +191,12 @@
     var open = setMktStatus();
     if (open) { refreshPrices(); setTimeout(tick, 5 * 60 * 1000); }
     else {
+      // 閉場中でも60分毎に更新（窓の再取得＝翌営業日窓へ自動追従・デッドロック回避）
+      refreshPrices();
       var now = Date.now(), wait;
-      if (MKT.open_ms && now < MKT.open_ms) wait = MKT.open_ms - now; else wait = 6 * 3600 * 1000;
-      setTimeout(tick, Math.max(60000, Math.min(wait, 6 * 3600 * 1000)));
+      if (MKT.open_ms && now < MKT.open_ms) wait = Math.min(MKT.open_ms - now, 60 * 60 * 1000);
+      else wait = 60 * 60 * 1000;
+      setTimeout(tick, Math.max(60000, wait));
     }
   }
 
