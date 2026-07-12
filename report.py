@@ -126,8 +126,39 @@ FALLBACK_UNIVERSE = [
 
 
 def _norm_ticker(t: str) -> str:
-    """Wikipedia表記(BRK.B)→yfinance表記(BRK-B)。"""
+    """Wikipedia表記(BRK.B)→yfinance表記(BRK-B)。trim＋大文字化。"""
     return (t or "").strip().upper().replace(".", "-")
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """レーベンシュタイン距離（差が3以上は早期に99）。"""
+    a = a or ""
+    b = b or ""
+    if abs(len(a) - len(b)) > 2:
+        return 99
+    lb = len(b)
+    dp = list(range(lb + 1))
+    for i in range(1, len(a) + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, lb + 1):
+            cur = dp[j]
+            dp[j] = min(dp[j] + 1, dp[j - 1] + 1, prev + (0 if a[i - 1] == b[j - 1] else 1))
+            prev = cur
+    return dp[lb]
+
+
+def _suggest_ticker(code: str, valid) -> str | None:
+    """編集距離1〜2の最も近い既知ティッカーを返す（無ければNone）。"""
+    code = (code or "").upper()
+    best, bd = None, 3
+    for t in (valid or ()):
+        if not t or t == code:
+            continue
+        d = _edit_distance(code, t)
+        if d < bd or (d == bd and best is not None and len(t) < len(best)):
+            best, bd = t, d
+    return best if (best is not None and bd <= 2) else None
 
 
 UNIVERSE_REDUCED = {"reduced": False}  # フォールバック（縮小モード）フラグ
@@ -138,6 +169,30 @@ POOL_REDUCED = {"reduced": False}      # 候補プール縮小モードフラグ
 SP500_MCAP_MIN = 22_700_000_000        # S&P採用の時価総額目安 $22.7B（改定するため定数化）
 SCREEN_MCAP_MIN = 15_000_000_000       # スクリーナー候補プールの下限 $15B
 CANDIDATES_FILE = DOCS / "candidates.json"
+# 機能1: メディア注目リスト（candidates_media.txt が無ければ内蔵デフォルトを使用）
+#   内蔵デフォルト asof 2026-07 ／ 出典＝アナリスト予想・予測市場
+MEDIA_FILE = Path("candidates_media.txt")
+MEDIA_DEFAULT = ["SOFI", "ALNY", "RDDT", "PSTG", "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR"]
+
+
+def _load_media() -> list[tuple[str, str]]:
+    """candidates_media.txt（1行=ティッカー[,メモ]・#はコメント）を読む。無ければ内蔵デフォルト。"""
+    out: list[tuple[str, str]] = []
+    if MEDIA_FILE.exists():
+        try:
+            for line in MEDIA_FILE.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                parts = [p.strip() for p in s.replace("\t", ",").split(",")]
+                tk = _norm_ticker(parts[0])
+                if tk:
+                    out.append((tk, parts[1] if len(parts) > 1 and parts[1] else ""))
+        except Exception as e:
+            print(f"[globe] candidates_media.txt読込失敗: {e}", file=sys.stderr)
+    if not out:
+        out = [(t, "") for t in MEDIA_DEFAULT]
+    return out
 CANDIDATE_SEED = [  # スクリーナー失敗時のフォールバック（SOFI級の準大型・成長株）
     "SOFI", "RDDT", "ALNY", "PSTG", "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR",
     "HOOD", "DKNG", "TOST", "CELH", "SNOW",
@@ -706,6 +761,26 @@ def screen_candidates() -> tuple[list[dict], dict]:
         pass
     for x in cands:
         x["status"] = "NEW" if x["c"] not in prev_codes else "OK"
+        x["src"] = "auto"
+    # 機能1: メディア注目銘柄をマージ（重複除去・既存の基準チェックを同様に判定・S&P500採用済みは除外）
+    auto_codes = {x["c"]: x for x in cands}
+    for tk, memo in _load_media():
+        if tk in SP500_SET:      # 現S&P500構成銘柄は除外（採用されたら自動的に消える）
+            continue
+        if tk in auto_codes:     # 自動判定にも入っている＝両方
+            auto_codes[tk]["src"] = "both"
+            if memo:
+                auto_codes[tk]["memo"] = memo
+            continue
+        try:
+            crit, mcap, name = _eval_criteria(tk, 0.0)
+        except Exception as e:  # noqa
+            print(f"[globe] media基準判定失敗 {tk}: {e}", file=sys.stderr)
+            crit, mcap, name = {}, 0.0, tk
+        met = sum(1 for v in crit.values() if v)
+        cands.append({"c": tk, "n": name or tk, "mcap": mcap, "crit": crit,
+                      "met": met, "score": round(met, 3),
+                      "status": "OK", "src": "media", "memo": memo})
     meta = {"asof": datetime.now(tz=JST).strftime("%Y-%m-%d %H:%M"),
             "threshold": SP500_MCAP_MIN, "reduced": POOL_REDUCED["reduced"]}
     return cands, meta
@@ -926,16 +1001,21 @@ def _candidate_card(x: dict, amap: dict) -> str:
     checks = "".join("✅" if crit.get(k) else "❌" for k in ("mc", "ttm", "q", "us", "age"))
     tech = _badge(a.g) if a else '<span class="badge hold">?</span>'
     newb = '<span class="badge buy">NEW</span>' if x.get("status") == "NEW" else ""
+    _src = x.get("src", "auto")
+    srcb = {"auto": '<span class="badge src-auto">🤖 自動判定</span>',
+            "media": '<span class="badge src-media">📰 メディア注目</span>',
+            "both": '<span class="badge src-both">🤖📰 両方</span>'}.get(_src, "")
+    memo = f'<span class="cmemo">{_esc(x.get("memo",""))}</span>' if x.get("memo") else ""
     mcap_b = f"${x['mcap']/1e9:.1f}B" if x.get("mcap") else "—"
     px = (f'<span class="price" data-px="{_esc(x["c"])}" data-usd="{a.price}">{_usd(a.price)}</span>'
           if a else '<span class="price">—</span>')
     return (
         f'<div class="card"><div class="row1">'
         f'<div class="title"><span class="code">{_esc(x["c"])}</span>'
-        f'<span class="name">{_esc(x["n"])}</span></div>{newb}{tech}</div>'
+        f'<span class="name">{_esc(x["n"])}</span></div>{srcb}{newb}{tech}</div>'
         f'<div class="row2">{px}'
         f'<span class="seg">時価総額 {mcap_b}</span>'
-        f'<span class="chip">基準 {checks} ({x["met"]}/5)</span></div></div>'
+        f'<span class="chip">基準 {checks} ({x["met"]}/5)</span>{memo}</div></div>'
     )
 
 
@@ -1002,6 +1082,10 @@ border-radius:8px;padding:1px 6px;margin-left:6px}
 .badge.buy{background:rgba(70,196,106,.18);color:var(--buy)}
 .badge.sell{background:rgba(240,97,109,.18);color:var(--sell)}
 .badge.hold{background:rgba(142,163,200,.16);color:var(--hold)}
+.badge.src-auto{background:rgba(142,163,200,.16);color:var(--mut)}
+.badge.src-media{background:rgba(232,201,106,.16);color:var(--gold)}
+.badge.src-both{background:rgba(70,196,106,.16);color:var(--up)}
+.cmemo{font-size:11px;color:var(--mut);margin-left:6px}
 .star,.rm{background:none;border:none;color:var(--gold);font-size:18px;cursor:pointer;padding:0 2px}
 .rm{color:var(--sell);font-size:16px}
 .row2{display:flex;align-items:center;gap:10px;margin-top:8px}
@@ -1019,6 +1103,9 @@ border-radius:8px;padding:1px 6px;margin-left:6px}
 .fair.up b{color:var(--up)}.fair.dn b{color:var(--dn)}.fair.hold b{color:var(--gold)}
 .pl{margin-top:8px;font-size:13px;font-weight:800}
 .pl.up{color:var(--up)}.pl.dn{color:var(--dn)}
+.hold-sum{margin:0 0 10px;padding:10px 13px;border:1px solid var(--line);border-radius:12px;background:var(--card);font-size:13px;color:var(--ink)}
+.hold-sum b.up{color:var(--up)}.hold-sum b.dn{color:var(--dn)}
+.hold-sum-note{color:var(--mut);font-size:10.5px;margin-left:6px}
 .hnote{font-size:11px;color:var(--mut);margin-left:8px;font-weight:600}
 .cfoot{font-size:11px;color:var(--mut);line-height:1.7;margin:10px 2px 0;padding:8px 10px;background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:10px}
 .ez{margin-top:8px;font-size:12px;font-weight:800;color:var(--fg);
@@ -1339,17 +1426,23 @@ def _to_stock_json(a: Analysis, rank: int) -> dict:
     }
 
 
-def _holding_card(h: dict, amap: dict) -> str:
+def _holding_card(h: dict, amap: dict, valid=None) -> str:
     code = h.get("code")
     a = amap.get(code)
     avg = h.get("avg", 0) or 0
     if not a:
-        # データ取得不可でも保有として必ず表示（サイレント脱落させない）
+        # データ取得不可でも保有として必ず表示（サイレント脱落させない）＋タイポ候補を提示
+        sug = _suggest_ticker(code, valid or set())
+        if sug:
+            hint = (f'⚠ {_esc(code)}：データ取得不可 — もしかして <b>{_esc(sug)}</b>？'
+                    f'（holdings.txtを修正してください）')
+        else:
+            hint = f'⚠ {_esc(code)}：データ取得不可（ティッカー確認 or 一時的な取得失敗）'
         return (f'<div class="card"><div class="row1"><span class="rank">保有</span>'
                 f'<div class="title"><span class="code">{_esc(code)}</span>'
                 f'<span class="name">買値 {_usd(avg)}</span></div>'
                 f'<span class="badge hold">?</span></div>'
-                f'<div class="pl dn">⚠ データ取得不可（ティッカー確認 or 一時的な取得失敗）</div></div>')
+                f'<div class="pl dn">{hint}</div></div>')
     if h.get("tgt"):
         a.tgt = h["tgt"]
     if h.get("stp"):
@@ -1373,8 +1466,32 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
     amap = {a.code: a for a in analyses}
     ver = datetime.now(tz=JST).strftime("%Y%m%d%H%M")
 
-    buy_cards = "".join(_card(i + 1, a, True) for i, a in enumerate(buys)) or '<p class="empty">本日は買いシグナル（スコア35以上）がありません。</p>'
-    hold_cards = "".join(_holding_card(h, amap) for h in holdings)
+    # 機能2: 買い候補ランキング＝「プロ予想乖離 tp>0」かつ「val=割安」の両方を満たす銘柄のみ・スコア降順・最大10件
+    #   （analyses はスコア降順のため出現順を維持。buys/shown/検索/バックテストは不変）
+    buy_rank = [a for a in analyses
+                if a.fund and a.fund.get("target_pct") is not None
+                and a.fund["target_pct"] > 0 and a.fund.get("valuation") == "割安"][:10]
+    if buy_rank:
+        buy_cards = "".join(_card(i + 1, a, True) for i, a in enumerate(buy_rank))
+        if len(buy_rank) < 10:
+            buy_cards += f'<p class="empty">本日、条件を満たすのは{len(buy_rank)}銘柄です。</p>'
+    else:
+        buy_cards = '<p class="empty">本日は条件を満たす銘柄がありません。</p>'
+    _valid_tk = set(amap.keys()) | SP500_SET
+    # 機能4: 保有サマリー行（合計評価損益・¥換算・含み益/含み損 銘柄数）※USDJPYはprices.jsonと同レート
+    _res = [(h, amap.get(h.get("code"))) for h in holdings]
+    _rv = [(h, a) for h, a in _res if a]
+    hold_sum = ""
+    if _rv:
+        _tot = sum((a.price - (h.get("avg") or 0)) for h, a in _rv)
+        _win = sum(1 for h, a in _rv if a.price >= (h.get("avg") or 0))
+        _los = sum(1 for h, a in _rv if a.price < (h.get("avg") or 0))
+        _yen = f"¥{round(_tot * usdjpy):,}" if usdjpy else "¥—"
+        hold_sum = (f'<div class="hold-sum">💼 合計評価損益 '
+                    f'<b class="{"up" if _tot>=0 else "dn"}">{"+" if _tot>=0 else ""}{_usd(_tot)}</b>'
+                    f'（¥換算 {_yen}）／ 含み益{_win}銘柄・含み損{_los}銘柄'
+                    f'<span class="hold-sum-note">（1株あたり合算）</span></div>')
+    hold_cards = hold_sum + "".join(_holding_card(h, amap, _valid_tk) for h in holdings)
     hold_sec = _section("💼 保有銘柄", "MY HOLDINGS", hold_cards) if holdings else ""
     cand_sec = _candidate_section(cands, cmeta, amap)
 
@@ -1424,7 +1541,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
     <div id="results" class="cards"></div>
   </section>
 
-  {_section("買いシグナル TOP20", "BUY SIGNALS ・ スコア35以上のみ", buy_cards)}
+  {_section("買い候補ランキング TOP10", "条件：アナリスト予想プラス × 割安判定", buy_cards)}
   {hold_sec}
 
   <footer>
