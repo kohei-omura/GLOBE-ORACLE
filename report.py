@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import sys
@@ -573,6 +574,34 @@ def _download_batch(tickers: list[str], period: str = "1y") -> dict[str, pd.Data
     return out
 
 
+def _div_yield(info: dict) -> float | None:
+    """配当利回りを小数（0.025 = 2.5%）に正規化して返す。
+
+    yfinance 0.2.51 以降 `dividendYield` は「％値」（2.5 = 2.5%）を返すようになったため、
+    そのまま小数として扱うと表示・判定が100倍ズレる。dividendRate÷株価 で検算できるときは
+    それに近い解釈を採り、できないときは requirements.txt が要求する 0.2.54+ の仕様
+    （＝％値）とみなして100で割る。
+    """
+    try:
+        v = float(info.get("dividendYield"))
+    except (TypeError, ValueError):
+        return None
+    if not (v > 0):          # 0/負/NaN は配当なし扱い
+        return None
+    ref = None
+    try:
+        rate = float(info.get("dividendRate"))
+        px = float(info.get("currentPrice") or info.get("regularMarketPrice")
+                   or info.get("previousClose") or 0)
+        if rate > 0 and px > 0:
+            ref = rate / px          # 小数の実測値
+    except (TypeError, ValueError):
+        ref = None
+    if ref:
+        return v / 100.0 if abs(v / 100.0 - ref) <= abs(v - ref) else v
+    return v / 100.0
+
+
 def _fetch_fundamentals(codes: list[str]) -> dict[str, dict]:
     """上位＋ウォッチ銘柄のみ Ticker.info を叩く（全銘柄は禁止）。"""
     import yfinance as yf
@@ -584,7 +613,7 @@ def _fetch_fundamentals(codes: list[str]) -> dict[str, dict]:
                 "per": info.get("trailingPE"),
                 "pbr": info.get("priceToBook"),
                 "roe": info.get("returnOnEquity"),
-                "div": info.get("dividendYield"),
+                "div": _div_yield(info),
                 "target_mean": info.get("targetMeanPrice"),
                 "reco": info.get("recommendationKey"),
                 "eps": info.get("trailingEps"),
@@ -1291,7 +1320,13 @@ APP_JS = r"""
   }
   function setMktStatus() {
     var el = document.getElementById('mkt'); if (!el) return;
-    var now = Date.now(), open = MKT.market_open && now >= MKT.open_ms && now < MKT.close_ms;
+    var now = Date.now();
+    /* 開場判定は埋め込み窓(epoch)で行う。market_openはHTML/prices.json生成時点の
+       スナップショットなので、窓内に入っても閉場のまま固まる（＝5分ポーリングに
+       切り替わらない）。窓が無いときだけフラグにフォールバックする。 */
+    var open = (MKT.open_ms && MKT.close_ms)
+      ? (now >= MKT.open_ms && now < MKT.close_ms)
+      : MKT.market_open;
     if (open) { el.className = 'mkt open'; el.textContent = 'NY市場：開場中🟢'; }
     else { el.className = 'mkt closed'; el.textContent = 'NY市場：閉場⚫（次回 JST ' + MKT.next_open + '〜' + MKT.next_close + '）'; }
     return open;
@@ -1443,10 +1478,17 @@ def _holding_card(h: dict, amap: dict, valid=None) -> str:
                 f'<span class="name">買値 {_usd(avg)}</span></div>'
                 f'<span class="badge hold">?</span></div>'
                 f'<div class="pl dn">{hint}</div></div>')
-    if h.get("tgt"):
-        a.tgt = h["tgt"]
-    if h.get("stp"):
-        a.stp = h["stp"]
+    if h.get("tgt") or h.get("stp"):
+        # holdings.txt の手動指定はこのカード限定。共有のAnalysisを書き換えると
+        # stocks.json や他セクションの自動算出水準まで上書きされてしまう。
+        a = copy.copy(a)
+        if h.get("tgt"):
+            a.tgt = h["tgt"]
+        if h.get("stp"):
+            a.stp = h["stp"]
+        # 水準が変わったのでRRも手動値ベースで再計算（自動算出のRRが残ると矛盾する）
+        a.rr = (round((a.tgt - a.price) / (a.price - a.stp), 1)
+                if (a.tgt and a.stp and a.price > a.stp) else None)
     pl_pct = round((a.price - avg) / avg * 100.0, 1) if avg else 0.0
     cls = "up" if pl_pct >= 0 else "dn"
     pl = (f'<div class="pl {cls}">損益 {"+" if pl_pct>=0 else ""}{pl_pct}%'
@@ -1462,12 +1504,11 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
     holdings = holdings or []
     cands = cands or []
     cmeta = cmeta or {}
-    buys = [a for a in analyses if a.g == "BUY"][:20]
     amap = {a.code: a for a in analyses}
     ver = datetime.now(tz=JST).strftime("%Y%m%d%H%M")
 
     # 機能2: 買い候補ランキング＝「プロ予想乖離 tp>0」かつ「val=割安」の両方を満たす銘柄のみ・スコア降順・最大10件
-    #   （analyses はスコア降順のため出現順を維持。buys/shown/検索/バックテストは不変）
+    #   （analyses はスコア降順のため出現順を維持。検索/バックテストは不変）
     buy_rank = [a for a in analyses
                 if a.fund and a.fund.get("target_pct") is not None
                 and a.fund["target_pct"] > 0 and a.fund.get("valuation") == "割安"][:10]
@@ -1495,7 +1536,14 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
     hold_sec = _section("💼 保有銘柄", "MY HOLDINGS", hold_cards) if holdings else ""
     cand_sec = _candidate_section(cands, cmeta, amap)
 
-    shown = [a.code for a in buys] + [h.get("code") for h in holdings]
+    # ライブ価格(prices.json)の対象＝実際にカード表示している銘柄。
+    #   保有 → 買い候補ランキング → 候補レーダー の順（write_pricesが先頭40件に切るため優先度順）。
+    #   ここが表示内容とズレると prices.json に載らずカードの株価が更新されない。
+    shown = list(dict.fromkeys(
+        [h["code"] for h in holdings if h.get("code")]
+        + [a.code for a in buy_rank]
+        + [x["c"] for x in cands if x.get("c") in amap]
+    ))
 
     idx_row = (
         '<div class="idx">'
