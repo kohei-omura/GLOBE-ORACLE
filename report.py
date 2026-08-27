@@ -199,6 +199,24 @@ CANDIDATE_SEED = [  # スクリーナー失敗時のフォールバック（SOFI
     "HOOD", "DKNG", "TOST", "CELH", "SNOW",
 ]
 
+# ─────────────────────────────────────────────
+#  大化け候補レーダー（2桁株）定数
+#   ※「1年で30〜40倍」を当てるスクリーニングは存在しない。ここでやるのは
+#     急騰局面に入った銘柄が事前に示していた計測可能な特徴での相対順位付け。
+# ─────────────────────────────────────────────
+GROWTH_PX_MIN = 10.0                   # 2桁株の下限 $10
+GROWTH_PX_MAX = 100.0                  # 2桁株の上限（$100未満＝2桁）
+GROWTH_MCAP_MIN = 300_000_000          # 時価総額 $300M以上（超小型の仕手株を除外）
+GROWTH_VOL_MIN = 300_000               # 3ヶ月平均出来高 30万株以上（流動性）
+GROWTH_POOL_PER_SORT = 150             # スクリーナー1軸あたりの取得件数
+GROWTH_TOP_N = 5                       # 表示するランキング件数（1〜5位）
+GROWTH_POOL_REDUCED = {"reduced": False}
+GROWTH_SEED = [  # スクリーナー失敗時のフォールバック（高ボラの2桁株になりやすい銘柄群）
+    "SOFI", "AFRM", "HOOD", "DKNG", "CELH", "IONQ", "RGTI", "OKLO", "SMR", "ACHR",
+    "JOBY", "LUNR", "RKLB", "PLUG", "RIOT", "MARA", "CLSK", "WULF", "CIFR", "BTDR",
+    "AI", "BBAI", "SOUN", "TEM", "HIMS", "OSCR", "RXRX", "CRSP", "NTLA", "BEAM",
+]
+
 
 def _read_wiki_tables(url: str):
     """UA付きrequestsでWikipediaを取得しread_html。403回避・リトライ2回。"""
@@ -374,7 +392,7 @@ def _atr(high, low, close, n: int = 14) -> pd.Series:
 
 class Analysis:
     __slots__ = ("code", "name", "sector", "price", "sc", "g", "reasons",
-                 "tgt", "stp", "rr", "ez", "fund", "bt")
+                 "tgt", "stp", "rr", "ez", "fund", "bt", "gr")
 
     def __init__(self, code, name, sector, price):
         self.code = code
@@ -390,6 +408,7 @@ class Analysis:
         self.ez = None
         self.fund = None
         self.bt = None
+        self.gr = None      # 大化け候補スコア（growth_score の戻り値）
 
 
 def _clip(v, lo, hi):
@@ -533,6 +552,80 @@ def barrier_stats(df: pd.DataFrame, price: float, tgt: float, stp: float) -> dic
                 "n": total, "avg_days": avg_days}
     except Exception as e:
         print(f"[globe] barrier_stats失敗: {e}", file=sys.stderr)
+        return None
+
+
+def growth_score(df: pd.DataFrame) -> dict | None:
+    """2桁株の「大化け候補」スコア（0〜100）と内訳を返す。band外・データ不足はNone。
+
+    将来の上昇率を予測するものではない。SanDisk型の急騰局面に入った銘柄が
+    “入る前”に共通して示していた、日足だけで計測できる特徴を合成した相対値。
+      mom6   6ヶ月騰落率         … トレンドが既に効いているか  (0〜30点)
+      accel  3ヶ月 vs 6ヶ月      … 上昇が加速しているか        (0〜15点)
+      vsurge 直近20日÷以前5ヶ月  … 資金が入り始めているか      (0〜20点)
+      atrp   ATR14 ÷ 株価        … そもそも値幅を出せる銘柄か  (0〜15点)
+      nh     52週高値からの位置  … ブレイクアウト圏にいるか    (0〜20点)
+    """
+    try:
+        close = df["Close"].dropna()
+        if len(close) < 120:                      # 半年未満は判定材料が足りない
+            return None
+        price = float(close.iloc[-1])
+        if not (GROWTH_PX_MIN <= price < GROWTH_PX_MAX):   # 2桁株のみ
+            return None
+
+        def _chg(nbars: int):
+            if len(close) <= nbars:
+                return None
+            base = float(close.iloc[-1 - nbars])
+            return (price / base - 1.0) * 100.0 if base > 0 else None
+
+        mom3, mom6 = _chg(63), _chg(126)
+        base1y = float(close.iloc[0])
+        mom12 = (price / base1y - 1.0) * 100.0 if base1y > 0 else None
+
+        atrp = None
+        a1 = float(_atr(df["High"], df["Low"], df["Close"], 14).iloc[-1])
+        if a1 == a1 and price > 0:                # NaNチェック
+            atrp = a1 / price * 100.0
+
+        vsurge = None
+        if "Volume" in df.columns:
+            v = df["Volume"].dropna()
+            if len(v) >= 126:
+                # 直近20日 ÷ それ以前の約5ヶ月平均。基準側に直近を含めると倍率が薄まるため除外。
+                v_base = float(v.iloc[-126:-20].mean())
+                if v_base > 0:
+                    vsurge = float(v.iloc[-20:].mean()) / v_base
+
+        nh = None
+        hi = df["High"].dropna()
+        if len(hi):
+            hi52 = float(hi.max())                # 1年分の日足＝実質52週高値
+            if hi52 > 0:
+                nh = price / hi52 * 100.0
+
+        sc = 0.0
+        if mom6 is not None:                      # 6ヶ月+100%で満点
+            sc += _clip(mom6 / 100.0, 0.0, 1.0) * 30.0
+        if mom3 is not None and mom6 is not None and mom6 > 0:
+            sc += _clip((mom3 / mom6 - 0.5) / 0.5, 0.0, 1.0) * 15.0
+        if vsurge is not None:                    # 出来高2倍で満点
+            sc += _clip(vsurge - 1.0, 0.0, 1.0) * 20.0
+        if atrp is not None:                      # ATR 2%→0点 / 6%で満点
+            sc += _clip((atrp - 2.0) / 4.0, 0.0, 1.0) * 15.0
+        if nh is not None:                        # 52週高値の95%以上で満点
+            sc += _clip((nh - 70.0) / 25.0, 0.0, 1.0) * 20.0
+
+        return {"score": round(sc, 1), "price": round(price, 2),
+                "mom3": None if mom3 is None else round(mom3, 1),
+                "mom6": None if mom6 is None else round(mom6, 1),
+                "mom12": None if mom12 is None else round(mom12, 1),
+                "vsurge": None if vsurge is None else round(vsurge, 2),
+                "atrp": None if atrp is None else round(atrp, 1),
+                "nh": None if nh is None else round(nh, 1)}
+    except Exception as e:
+        print(f"[globe] growth_score失敗: {e}", file=sys.stderr)
         return None
 
 
@@ -730,6 +823,49 @@ def _screen_pool() -> list[dict]:
     return pool
 
 
+def _growth_pool() -> list[dict]:
+    """大化け候補の母集団：米国・株価$10〜$100未満・時価総額$300M超・出来高30万株超。
+
+    Yahooスクリーナーは1リクエスト1ソート軸なので、性格の違う2軸から上位を取り
+    和集合にする（片方だけだと「もう上がりきった銘柄」or「株価と無関係な増収株」
+    に寄るため）。失敗時は GROWTH_SEED にフォールバック。
+    """
+    import yfinance as yf
+    pool: dict[str, dict] = {}
+    try:
+        q = yf.EquityQuery("and", [
+            yf.EquityQuery("eq", ["region", "us"]),
+            yf.EquityQuery("btwn", ["intradayprice", GROWTH_PX_MIN, GROWTH_PX_MAX]),
+            yf.EquityQuery("gt", ["intradaymarketcap", GROWTH_MCAP_MIN]),
+            yf.EquityQuery("gt", ["avgdailyvol3m", GROWTH_VOL_MIN]),
+        ])
+        for field in ("fiftytwowkpercentchange",                     # 直近1年で既に走っている
+                      "totalrevenues1yrgrowth.lasttwelvemonths"):    # 業績が跳ねている
+            try:
+                res = yf.screen(q, size=GROWTH_POOL_PER_SORT, sortField=field, sortAsc=False)
+            except Exception as e:
+                print(f"[globe] growth screen失敗 {field}: {e}", file=sys.stderr)
+                continue
+            for qt in _extract_quotes(res):
+                c = _norm_ticker(str(qt.get("symbol", "")))
+                if not c or c in pool:
+                    continue
+                if str(qt.get("quoteType") or "EQUITY").upper() != "EQUITY":
+                    continue
+                pool[c] = {"c": c,
+                           "n": qt.get("shortName") or qt.get("longName") or c,
+                           "mcap": qt.get("marketCap") or 0}
+    except Exception as e:
+        print(f"[globe] growth pool失敗: {e}", file=sys.stderr)
+    if len(pool) < 10:
+        GROWTH_POOL_REDUCED["reduced"] = True
+        pool = {c: {"c": c, "n": c, "mcap": 0} for c in GROWTH_SEED}
+    else:
+        GROWTH_POOL_REDUCED["reduced"] = False
+    print(f"growth pool: {len(pool)} reduced={GROWTH_POOL_REDUCED['reduced']}", file=sys.stderr)
+    return list(pool.values())
+
+
 def _eval_criteria(code: str, mcap_hint: float) -> tuple[dict, float, str]:
     """5基準チェックを判定。返り値: (crit, mcap, name)。"""
     import yfinance as yf
@@ -815,7 +951,7 @@ def screen_candidates() -> tuple[list[dict], dict]:
     return cands, meta
 
 
-def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict]:
+def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict, list[Analysis]]:
     holdings = load_holdings()
     hold_codes = [h["code"] for h in holdings]
     uni = fetch_universe()
@@ -883,6 +1019,7 @@ def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict]:
     missing = [c for c in cand_codes if c not in have]
     if missing:
         cframes = _download_batch(missing, "1y")
+        frames.update(cframes)   # 後段（大化け候補レーダー）で再ダウンロードしないよう合流
         for c in missing:
             df = cframes.get(c)
             if df is None:
@@ -904,9 +1041,48 @@ def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict]:
             except Exception as e:
                 print(f"[globe] 候補分析失敗 {c}: {e}", file=sys.stderr)
 
+    # ── 大化け候補レーダー（2桁株）TOP5 ──
+    growth: list[Analysis] = []
+    try:
+        gmeta = {p["c"]: p for p in _growth_pool()}
+        need = [c for c in gmeta if c not in frames]
+        if need:
+            frames.update(_download_batch(need, "1y"))
+        scored: list[tuple[float, str, dict]] = []
+        for c in gmeta:
+            df = frames.get(c)
+            if df is None:
+                continue
+            gr = growth_score(df)
+            if gr:
+                scored.append((gr["score"], c, gr))
+        # 同点はティッカー順で決定的に（日々の並びが無意味に入れ替わらないように）
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        amap_g = {a.code: a for a in analyses}
+        for _sc, c, gr in scored[:GROWTH_TOP_N]:
+            a = amap_g.get(c)
+            if a is None:   # ユニバース外の銘柄は上位入りした分だけ分析して合流
+                try:
+                    df = frames[c]
+                    price = float(df["Close"].dropna().iloc[-1])
+                    tsc, reasons, lv = technical_score(df)
+                    a = Analysis(c, gmeta[c].get("n") or c, "", round(price, 2))
+                    a.sc, a.g, a.reasons = tsc, signal_of(tsc), reasons
+                    if lv:
+                        a.tgt, a.stp, a.rr, a.ez = lv["tgt"], lv["stp"], lv["rr"], lv["ez"]
+                    analyses.append(a)
+                except Exception as e:
+                    print(f"[globe] 大化け候補分析失敗 {c}: {e}", file=sys.stderr)
+                    continue
+            gr["mcap"] = gmeta[c].get("mcap") or 0
+            a.gr = gr
+            growth.append(a)
+    except Exception as e:
+        print(f"[globe] 大化け候補レーダー失敗: {e}", file=sys.stderr)
+
     analyses.sort(key=lambda x: x.sc, reverse=True)
     meta = market_window()
-    return analyses, meta, holdings, cands, cmeta
+    return analyses, meta, holdings, cands, cmeta, growth
 
 
 # ─────────────────────────────────────────────
@@ -1061,6 +1237,50 @@ def _candidate_section(cands: list[dict], cmeta: dict, amap: dict) -> str:
             f'<em>毎日自動判定</em></h2><div class="cards">{cards}</div>{foot}</section>')
 
 
+def _growth_card(rank: int, a: Analysis) -> str:
+    gr = a.gr or {}
+
+    def _pct(v) -> str:
+        return "—" if v is None else f'{"+" if v >= 0 else ""}{v:.0f}%'
+
+    chips = [f'1年 {_pct(gr.get("mom12"))}', f'6ヶ月 {_pct(gr.get("mom6"))}']
+    chips.append(f'出来高 {gr["vsurge"]:.1f}倍' if gr.get("vsurge") else "出来高 —")
+    chips.append(f'ATR {gr["atrp"]:.1f}%' if gr.get("atrp") else "ATR —")
+    chips.append(f'52週高値比 {gr["nh"]:.0f}%' if gr.get("nh") else "52週高値比 —")
+    chips_html = '<div class="reasons">' + "".join(
+        f'<span class="chip">{_esc(c)}</span>' for c in chips) + "</div>"
+    mcap = f'<span class="seg">時価総額 ${gr["mcap"]/1e9:.1f}B</span>' if gr.get("mcap") else ""
+    gsc = float(gr.get("score") or 0.0)
+    return (
+        f'<div class="card"><div class="row1"><span class="rank">{rank}</span>'
+        f'<div class="title"><span class="code">{_esc(a.code)}</span>'
+        f'<span class="name">{_esc(a.name)}</span>{mcap}</div>{_badge(a.g)}</div>'
+        f'<div class="row2">'
+        f'<span class="price" data-px="{_esc(a.code)}" data-usd="{a.price}">{_usd(a.price)}</span>'
+        f'<span class="gscore">爆発力 {gsc:.0f}</span>'
+        f'<span class="bar"><span class="bar-g" style="width:{_clip(gsc, 0.0, 100.0):.0f}%"></span></span>'
+        f'</div>{chips_html}</div>'
+    )
+
+
+def _growth_section(growth: list[Analysis] | None) -> str:
+    if not growth:
+        return ""
+    cards = "".join(_growth_card(i + 1, a) for i, a in enumerate(growth))
+    reduced = ('<span style="color:var(--dn)">⚠ 母集団縮小モード</span> '
+               if GROWTH_POOL_REDUCED.get("reduced") else "")
+    foot = (f'<p class="cfoot">{reduced}株価 ${GROWTH_PX_MIN:.0f}〜${GROWTH_PX_MAX:.0f}未満（2桁株）・'
+            f'時価総額 ${GROWTH_MCAP_MIN/1e6:.0f}M超・3ヶ月平均出来高 {GROWTH_VOL_MIN:,}株超の米国株から、'
+            f'「6ヶ月モメンタム／上昇の加速／出来高急増／ATR（値幅）／52週高値からの位置」の5要素で'
+            f'採点した上位{GROWTH_TOP_N}銘柄です。'
+            f'<br><b style="color:var(--dn)">これは「1年で30〜40倍になる銘柄」を予測するものではありません。</b>'
+            f'SanDisk型の急騰局面に入った銘柄が事前に示していた特徴を並べているだけで、'
+            f'同じ特徴を持つ銘柄の大半は大化けせず、高ボラティリティは下落幅も大きいことを意味します。'
+            f'1銘柄への集中投資は避けてください。</p>')
+    return (f'<section class="sec"><h2 class="find"><span>🚀 大化け候補レーダー（2桁株）TOP{GROWTH_TOP_N}</span>'
+            f'<em>高ボラ×出来高急増×高値圏</em></h2><div class="cards">{cards}</div>{foot}</section>')
+
+
 CSS_STR = r"""
 :root{--bg:#0a0f1e;--bg2:#0f1730;--card:#111c38;--line:rgba(255,255,255,.08);
 --fg:#eaf0ff;--mut:#8ea3c8;--gold:#e8c96a;--gold2:#caa64c;
@@ -1146,6 +1366,8 @@ background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:10px
 .fchip,.btchip,.chip{font-size:11px;padding:2px 8px;border-radius:8px;border:1px solid var(--line);color:var(--mut)}
 .btchip.win{color:var(--up);border-color:rgba(70,196,106,.4)}
 .chip{color:var(--gold2);border-color:rgba(232,201,106,.28)}
+.gscore{font-size:14px;font-weight:800;color:var(--gold);white-space:nowrap}
+.bar-g{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--gold2),var(--gold))}
 .empty{color:var(--mut);font-size:13px;padding:14px;text-align:center}
 footer{margin-top:26px;padding:16px 0;text-align:center;font-size:11px;color:var(--mut);line-height:1.7}
 """
@@ -1500,10 +1722,12 @@ def _holding_card(h: dict, amap: dict, valid=None) -> str:
 def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
                     holdings: list[dict] | None = None,
                     cands: list[dict] | None = None,
-                    cmeta: dict | None = None) -> tuple[str, dict]:
+                    cmeta: dict | None = None,
+                    growth: list[Analysis] | None = None) -> tuple[str, dict]:
     holdings = holdings or []
     cands = cands or []
     cmeta = cmeta or {}
+    growth = growth or []
     amap = {a.code: a for a in analyses}
     ver = datetime.now(tz=JST).strftime("%Y%m%d%H%M")
 
@@ -1535,13 +1759,15 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
     hold_cards = hold_sum + "".join(_holding_card(h, amap, _valid_tk) for h in holdings)
     hold_sec = _section("💼 保有銘柄", "MY HOLDINGS", hold_cards) if holdings else ""
     cand_sec = _candidate_section(cands, cmeta, amap)
+    growth_sec = _growth_section(growth)
 
     # ライブ価格(prices.json)の対象＝実際にカード表示している銘柄。
-    #   保有 → 買い候補ランキング → 候補レーダー の順（write_pricesが先頭40件に切るため優先度順）。
+    #   保有 → 買い候補 → 大化け候補 → 候補レーダー の順（write_pricesが先頭40件に切るため優先度順）。
     #   ここが表示内容とズレると prices.json に載らずカードの株価が更新されない。
     shown = list(dict.fromkeys(
         [h["code"] for h in holdings if h.get("code")]
         + [a.code for a in buy_rank]
+        + [a.code for a in growth]
         + [x["c"] for x in cands if x.get("c") in amap]
     ))
 
@@ -1590,6 +1816,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
   </section>
 
   {_section("買い候補ランキング TOP10", "条件：アナリスト予想プラス × 割安判定", buy_cards)}
+  {growth_sec}
   {hold_sec}
 
   <footer>
@@ -1615,13 +1842,13 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
 
 def write_dashboard() -> Path:
     try:
-        analyses, meta, holdings, cands, cmeta = analyze_all()
+        analyses, meta, holdings, cands, cmeta, growth = analyze_all()
     except Exception as e:
         print(f"[globe] analyze致命的失敗: {e}", file=sys.stderr)
         traceback.print_exc()
-        analyses, meta, holdings, cands, cmeta = [], market_window(), load_holdings(), [], {}
+        analyses, meta, holdings, cands, cmeta, growth = [], market_window(), load_holdings(), [], {}, []
     usdjpy = _fetch_usdjpy()
-    html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta)
+    html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta, growth)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
     (DOCS / "app.js").write_text(APP_JS, encoding="utf-8")
     (DOCS / "stocks.json").write_text(json.dumps(stocks, ensure_ascii=False), encoding="utf-8")
