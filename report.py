@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import copy
+import csv
 import json
 import math
+import re
 import sys
 import traceback
 from datetime import datetime, timezone, timedelta, date, time as dtime
@@ -208,9 +210,20 @@ GROWTH_PX_MIN = 10.0                   # 2桁株の下限 $10
 GROWTH_PX_MAX = 100.0                  # 2桁株の上限（$100未満＝2桁）
 GROWTH_MCAP_MIN = 300_000_000          # 時価総額 $300M以上（超小型の仕手株を除外）
 GROWTH_VOL_MIN = 300_000               # 3ヶ月平均出来高 30万株以上（流動性）
-GROWTH_POOL_PER_SORT = 150             # スクリーナー1軸あたりの取得件数
+GROWTH_POOL_PER_SORT = 150             # スクリーナー（フォールバック時）1軸あたりの取得件数
 GROWTH_TOP_N = 5                       # 表示するランキング件数（1〜5位）
+GROWTH_MAX_UNIVERSE = 9000             # 母集団の安全上限
+GROWTH_MAX_SCORE = 2500                # 1年日足を取って採点する上限（足切り後）
 GROWTH_POOL_REDUCED = {"reduced": False}
+GROWTH_UNIVERSE_SRC = {"src": "", "n_universe": 0, "n_scored": 0}
+# SBI証券の取扱銘柄一覧を置くファイル（任意）。あれば最優先で母集団に使う。
+#   SBIには取扱銘柄一覧の公開APIが無いため、正確に一致させたい場合だけ手動で用意する。
+GROWTH_UNIVERSE_FILE = Path("universe_sbi.txt")
+# 無い場合の自動生成元：NASDAQ Trader の公式シンボルディレクトリ（NYSE/NASDAQ/AMEX全上場）
+GROWTH_SYMBOL_DIR_URLS = (
+    "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+    "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
+)
 GROWTH_SEED = [  # スクリーナー失敗時のフォールバック（高ボラの2桁株になりやすい銘柄群）
     "SOFI", "AFRM", "HOOD", "DKNG", "CELH", "IONQ", "RGTI", "OKLO", "SMR", "ACHR",
     "JOBY", "LUNR", "RKLB", "PLUG", "RIOT", "MARA", "CLSK", "WULF", "CIFR", "BTDR",
@@ -632,11 +645,16 @@ def growth_score(df: pd.DataFrame) -> dict | None:
 # ─────────────────────────────────────────────
 #  データ取得（一括バッチ）＋ファンダ（上位のみ）
 # ─────────────────────────────────────────────
-def _download_batch(tickers: list[str], period: str = "1y") -> dict[str, pd.DataFrame]:
+def _download_batch(tickers: list[str], period: str = "1y",
+                    chunk: int = 100, pause: float = 0.0) -> dict[str, pd.DataFrame]:
+    """日足を一括取得。chunk=1回のリクエスト銘柄数、pause=チャンク間の待機秒（レート制限対策）。"""
     import yfinance as yf
+    import time as _t
     out: dict[str, pd.DataFrame] = {}
-    CHUNK = 100
+    CHUNK = max(1, chunk)
     for i in range(0, len(tickers), CHUNK):
+        if i and pause > 0:
+            _t.sleep(pause)
         part = tickers[i:i + CHUNK]
         for attempt in range(2):
             try:
@@ -823,8 +841,167 @@ def _screen_pool() -> list[dict]:
     return pool
 
 
-def _growth_pool() -> list[dict]:
-    """大化け候補の母集団：米国・株価$10〜$100未満・時価総額$300M超・出来高30万株超。
+_TICKER_RE = re.compile(r"[A-Z]{1,5}([.-][A-Z]{1,2})?$")
+# 普通株以外（ワラント／新株予約権／ユニット／優先株／預託証券／社債）を名称から除外する語
+_NON_COMMON_WORDS = ("warrant", " right", "rights", " unit", "units", "preferred",
+                     "depositary", "notes due", "debenture", "when issued", "%")
+
+
+def _http_text(url: str, timeout: int = 30) -> str | None:
+    """UA付きでテキストを取得（リトライ2回）。requests が無ければNone。"""
+    if requests is None:
+        return None
+    headers = {"User-Agent": "Mozilla/5.0 (GLOBE-ORACLE bot)"}
+    for attempt in range(2):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            if attempt == 1:
+                print(f"[globe] 取得失敗 {url}: {e}", file=sys.stderr)
+    return None
+
+
+def _is_common_stock(sym: str, name: str) -> bool:
+    """ティッカーと銘柄名から「普通株らしさ」を判定（ワラント/ユニット/優先株等を除外）。"""
+    if not sym or not _TICKER_RE.fullmatch(sym.strip().upper()):
+        return False
+    low = f" {(name or '').lower()} "
+    return not any(w in low for w in _NON_COMMON_WORDS)
+
+
+def _parse_symbol_dir(text: str) -> list[tuple[str, str]]:
+    """NASDAQ Trader のパイプ区切りシンボルディレクトリを (ticker, name) に変換。
+
+    nasdaqlisted.txt : Symbol|Security Name|Market Category|Test Issue|...|ETF|NextShares
+    otherlisted.txt  : ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|...|NASDAQ Symbol
+    末尾の "File Creation Time: ..." 行は読み飛ばす。
+    """
+    out: list[tuple[str, str]] = []
+    for row in csv.DictReader(io.StringIO(text), delimiter="|"):
+        raw = (row.get("NASDAQ Symbol") or row.get("Symbol") or row.get("ACT Symbol") or "").strip()
+        if not raw or raw.startswith("File Creation Time"):
+            continue
+        if (row.get("Test Issue") or "N").strip().upper() == "Y":     # テスト銘柄
+            continue
+        if (row.get("ETF") or "N").strip().upper() == "Y":            # ETFは大化け対象外
+            continue
+        name = (row.get("Security Name") or "").strip()
+        if not _is_common_stock(raw, name):
+            continue
+        out.append((_norm_ticker(raw), name.split(" - ")[0].strip() or raw))
+    return out
+
+
+def _load_universe_file() -> list[tuple[str, str]]:
+    """universe_sbi.txt（SBIの取扱銘柄一覧）を読む。CSVを貼っただけでも動くよう寛容に解釈。
+
+    各行から「ティッカーに見える最初のフィールド」を拾い、残りの最長フィールドを銘柄名とみなす。
+    文字コードは UTF-8 →（ダメなら）CP932 の順で試す（SBIのCSVはShift-JISのことがある）。
+    """
+    if not GROWTH_UNIVERSE_FILE.exists():
+        return []
+    text = None
+    for enc in ("utf-8", "utf-8-sig", "cp932"):
+        try:
+            text = GROWTH_UNIVERSE_FILE.read_text(encoding=enc)
+            break
+        except Exception:
+            continue
+    if text is None:
+        print(f"[globe] {GROWTH_UNIVERSE_FILE} の文字コードを判別できません", file=sys.stderr)
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        fields = [f.strip().strip('"') for f in s.replace("\t", ",").split(",") if f.strip()]
+        tk, idx = "", -1
+        for i, f in enumerate(fields):
+            cand = _norm_ticker(f)
+            if _TICKER_RE.fullmatch(cand):
+                tk, idx = cand, i
+                break
+        if not tk or tk in seen:
+            continue
+        seen.add(tk)
+        # 銘柄名はティッカーの次の列（CSVのほぼ共通レイアウト）。無ければティッカーで代用。
+        nm = fields[idx + 1] if idx + 1 < len(fields) else ""
+        out.append((tk, nm or tk))
+    return out
+
+
+def _growth_universe() -> list[dict]:
+    """大化け候補の母集団（SBIで買える米国株の全体像）を作る。
+
+    1) universe_sbi.txt があればそれを使う（SBIの取扱銘柄一覧そのもの＝最も正確）
+    2) 無ければ NASDAQ Trader の公式シンボルディレクトリから全米上場の普通株を抽出
+       （SBIの米国株ラインナップの実質スーパーセット。5,000〜6,500銘柄規模）
+    3) どちらも失敗したら Yahooスクリーナー、さらに失敗したら GROWTH_SEED
+    """
+    rows = _load_universe_file()
+    src = f"{GROWTH_UNIVERSE_FILE.name}（SBI取扱銘柄一覧）"
+    if not rows:
+        merged: dict[str, str] = {}
+        for url in GROWTH_SYMBOL_DIR_URLS:
+            text = _http_text(url)
+            if not text:
+                continue
+            for tk, nm in _parse_symbol_dir(text):
+                merged.setdefault(tk, nm)
+        rows = sorted(merged.items())
+        src = "全米上場（NASDAQ Trader公式リスト）"
+    if not rows:
+        pool = _screen_growth_pool()
+        GROWTH_UNIVERSE_SRC.update(src="Yahooスクリーナー", n_universe=len(pool))
+        return pool
+    rows = rows[:GROWTH_MAX_UNIVERSE]
+    GROWTH_POOL_REDUCED["reduced"] = False
+    GROWTH_UNIVERSE_SRC.update(src=src, n_universe=len(rows))
+    print(f"growth universe: {len(rows)} 銘柄 src={src}", file=sys.stderr)
+    return [{"c": tk, "n": nm, "mcap": 0} for tk, nm in rows]
+
+
+def _growth_prefilter(pool: list[dict]) -> list[dict]:
+    """段階1: 1ヶ月足だけを一括取得し「2桁株 × 流動性」で足切りする。
+
+    5,000銘柄超の1年日足をいきなり取ると重すぎるため、軽い1ヶ月足でふるいにかけ、
+    生き残りだけを段階2（1年日足＋採点）に渡す。上限を超える場合は
+    直近1ヶ月の伸びが大きい順に GROWTH_MAX_SCORE 件へ切り詰める。
+    """
+    if not pool:
+        return []
+    meta = {p["c"]: p for p in pool}
+    frames = _download_batch(list(meta), "1mo", chunk=200, pause=0.2)
+    keep: list[tuple[float, str]] = []
+    for c, df in frames.items():
+        try:
+            cl = df["Close"].dropna()
+            if len(cl) < 10:
+                continue
+            px = float(cl.iloc[-1])
+            if not (GROWTH_PX_MIN <= px < GROWTH_PX_MAX):     # 2桁株のみ
+                continue
+            if "Volume" in df.columns:
+                v = df["Volume"].dropna()
+                if len(v) and float(v.mean()) < GROWTH_VOL_MIN:
+                    continue
+            first = float(cl.iloc[0])
+            keep.append(((px / first - 1.0) if first > 0 else 0.0, c))
+        except Exception:
+            continue
+    keep.sort(key=lambda x: (-x[0], x[1]))   # 直近1ヶ月の伸び順（切り詰め時に候補性の高い方を残す）
+    out = [meta[c] for _, c in keep[:GROWTH_MAX_SCORE]]
+    GROWTH_UNIVERSE_SRC["n_scored"] = len(out)
+    print(f"growth prefilter: {len(meta)} -> {len(out)} 銘柄", file=sys.stderr)
+    return out
+
+
+def _screen_growth_pool() -> list[dict]:
+    """フォールバック用スクリーナー：米国・株価$10〜$100未満・時価総額$300M超・出来高30万株超。
 
     Yahooスクリーナーは1リクエスト1ソート軸なので、性格の違う2軸から上位を取り
     和集合にする（片方だけだと「もう上がりきった銘柄」or「株価と無関係な増収株」
@@ -864,6 +1041,21 @@ def _growth_pool() -> list[dict]:
         GROWTH_POOL_REDUCED["reduced"] = False
     print(f"growth pool: {len(pool)} reduced={GROWTH_POOL_REDUCED['reduced']}", file=sys.stderr)
     return list(pool.values())
+
+
+def _growth_pool() -> list[dict]:
+    """大化け候補の母集団を作って足切りまで済ませる（段階1）。
+
+    母集団は universe_sbi.txt → 全米上場リスト → Yahooスクリーナー → GROWTH_SEED の順で決まる。
+    そこから 2桁株×流動性 で絞った結果を返し、段階2（1年日足＋採点）は analyze_all が行う。
+    """
+    pool = _growth_prefilter(_growth_universe())
+    if len(pool) < 10:      # 母集団が壊れている＝ネットワーク不調。種リストで最低限動かす
+        GROWTH_POOL_REDUCED["reduced"] = True
+        pool = [{"c": c, "n": c, "mcap": 0} for c in GROWTH_SEED]
+        GROWTH_UNIVERSE_SRC.update(src="内蔵シードリスト", n_universe=len(pool), n_scored=len(pool))
+    print(f"growth pool: {len(pool)} reduced={GROWTH_POOL_REDUCED['reduced']}", file=sys.stderr)
+    return pool
 
 
 def _eval_criteria(code: str, mcap_hint: float) -> tuple[dict, float, str]:
@@ -1269,8 +1461,11 @@ def _growth_section(growth: list[Analysis] | None) -> str:
     cards = "".join(_growth_card(i + 1, a) for i, a in enumerate(growth))
     reduced = ('<span style="color:var(--dn)">⚠ 母集団縮小モード</span> '
                if GROWTH_POOL_REDUCED.get("reduced") else "")
-    foot = (f'<p class="cfoot">{reduced}株価 ${GROWTH_PX_MIN:.0f}〜${GROWTH_PX_MAX:.0f}未満（2桁株）・'
-            f'時価総額 ${GROWTH_MCAP_MIN/1e6:.0f}M超・3ヶ月平均出来高 {GROWTH_VOL_MIN:,}株超の米国株から、'
+    src = GROWTH_UNIVERSE_SRC.get("src") or "—"
+    n_uni, n_sc = GROWTH_UNIVERSE_SRC.get("n_universe", 0), GROWTH_UNIVERSE_SRC.get("n_scored", 0)
+    foot = (f'<p class="cfoot">{reduced}母集団：{_esc(src)} <b>{n_uni:,}銘柄</b> → '
+            f'株価 ${GROWTH_PX_MIN:.0f}〜${GROWTH_PX_MAX:.0f}未満（2桁株）・'
+            f'平均出来高 {GROWTH_VOL_MIN:,}株超で <b>{n_sc:,}銘柄</b>に絞り、'
             f'「6ヶ月モメンタム／上昇の加速／出来高急増／ATR（値幅）／52週高値からの位置」の5要素で'
             f'採点した上位{GROWTH_TOP_N}銘柄です。'
             f'<br><b style="color:var(--dn)">これは「1年で30〜40倍になる銘柄」を予測するものではありません。</b>'
