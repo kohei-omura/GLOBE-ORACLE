@@ -1143,6 +1143,24 @@ def screen_candidates() -> tuple[list[dict], dict]:
     return cands, meta
 
 
+def _analysis_from_frame(code: str, name: str, df: pd.DataFrame,
+                        sector: str = "") -> Analysis | None:
+    """取得済みの日足からテクニカル分析済みの Analysis を作る。判定不能ならNone。"""
+    try:
+        close = df["Close"].dropna()
+        if len(close) < 60:
+            return None
+        sc, reasons, lv = technical_score(df)
+        a = Analysis(code, name or code, sector, round(float(close.iloc[-1]), 2))
+        a.sc, a.g, a.reasons = sc, signal_of(sc), reasons
+        if lv:
+            a.tgt, a.stp, a.rr, a.ez = lv["tgt"], lv["stp"], lv["rr"], lv["ez"]
+        return a
+    except Exception as e:
+        print(f"[globe] 分析失敗 {code}: {e}", file=sys.stderr)
+        return None
+
+
 def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict, list[Analysis]]:
     holdings = load_holdings()
     hold_codes = [h["code"] for h in holdings]
@@ -1251,24 +1269,22 @@ def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict, l
         # 同点はティッカー順で決定的に（日々の並びが無意味に入れ替わらないように）
         scored.sort(key=lambda x: (-x[0], x[1]))
         amap_g = {a.code: a for a in analyses}
-        for _sc, c, gr in scored[:GROWTH_TOP_N]:
+        # 採点した銘柄はすべて検索対象(analyses)に合流させる。1年日足は取得済みなので
+        # 追加の通信は発生せず、テクニカル計算だけで検索できる銘柄が数倍になる。
+        for _sc, c, gr in scored:
             a = amap_g.get(c)
-            if a is None:   # ユニバース外の銘柄は上位入りした分だけ分析して合流
-                try:
-                    df = frames[c]
-                    price = float(df["Close"].dropna().iloc[-1])
-                    tsc, reasons, lv = technical_score(df)
-                    a = Analysis(c, gmeta[c].get("n") or c, "", round(price, 2))
-                    a.sc, a.g, a.reasons = tsc, signal_of(tsc), reasons
-                    if lv:
-                        a.tgt, a.stp, a.rr, a.ez = lv["tgt"], lv["stp"], lv["rr"], lv["ez"]
-                    analyses.append(a)
-                except Exception as e:
-                    print(f"[globe] 大化け候補分析失敗 {c}: {e}", file=sys.stderr)
+            if a is None:
+                a = _analysis_from_frame(c, gmeta[c].get("n") or c, frames[c])
+                if a is None:
                     continue
-            gr["mcap"] = gmeta[c].get("mcap") or 0
-            a.gr = gr
-            growth.append(a)
+                analyses.append(a)
+                amap_g[c] = a
+            if len(growth) < GROWTH_TOP_N:      # scoredはスコア降順なので先頭から上位
+                gr["mcap"] = gmeta[c].get("mcap") or 0
+                a.gr = gr
+                growth.append(a)
+        print(f"growth: 採点{len(scored)}銘柄を検索対象に合流 / TOP{len(growth)}を表示",
+              file=sys.stderr)
     except Exception as e:
         print(f"[globe] 大化け候補レーダー失敗: {e}", file=sys.stderr)
 
