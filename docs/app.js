@@ -167,7 +167,13 @@
   }
   function setMktStatus() {
     var el = document.getElementById('mkt'); if (!el) return;
-    var now = Date.now(), open = MKT.market_open && now >= MKT.open_ms && now < MKT.close_ms;
+    var now = Date.now();
+    /* 開場判定は埋め込み窓(epoch)で行う。market_openはHTML/prices.json生成時点の
+       スナップショットなので、窓内に入っても閉場のまま固まる（＝5分ポーリングに
+       切り替わらない）。窓が無いときだけフラグにフォールバックする。 */
+    var open = (MKT.open_ms && MKT.close_ms)
+      ? (now >= MKT.open_ms && now < MKT.close_ms)
+      : MKT.market_open;
     if (open) { el.className = 'mkt open'; el.textContent = 'NY市場：開場中🟢'; }
     else { el.className = 'mkt closed'; el.textContent = 'NY市場：閉場⚫（次回 JST ' + MKT.next_open + '〜' + MKT.next_close + '）'; }
     return open;
