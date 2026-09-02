@@ -41,6 +41,17 @@ DOCS.mkdir(exist_ok=True)
 
 WATCH_FALLBACK: list[str] = []  # クライアント側 localStorage 管理（サーバーは空でOK）
 
+# 分析がこの件数を下回ったら docs/ を上書きせず中止する（サイトを空で潰さないため）。
+#   内蔵 FALLBACK_UNIVERSE だけでも100銘柄前後は残るので、ここを割るのは
+#   ユニバース取得・日足取得の全経路が壊れたときだけ。前回比ではなく絶対下限にしているのは、
+#   一度銘柄数が増えた後に一部の取得だけ失敗した際、更新が止まり続けるのを避けるため。
+DASHBOARD_MIN_STOCKS = 50
+
+
+class DashboardSkipped(RuntimeError):
+    """分析結果が異常に少ないため、既存の docs/ を温存して更新を中止したことを表す。"""
+
+
 HOLDINGS_FILE = Path("holdings.txt")
 
 
@@ -2058,6 +2069,12 @@ def write_dashboard() -> Path:
         print(f"[globe] analyze致命的失敗: {e}", file=sys.stderr)
         traceback.print_exc()
         analyses, meta, holdings, cands, cmeta, growth = [], market_window(), load_holdings(), [], {}, []
+    if len(analyses) < DASHBOARD_MIN_STOCKS:
+        # ここで書き込むと既存の index.html / stocks.json を空同然の内容で潰してしまう。
+        # 何も書かずに中止し、呼び出し側（main.py）が非ゼロ終了してCIを赤にする。
+        raise DashboardSkipped(
+            f"分析できた銘柄が {len(analyses)} 件しかありません"
+            f"（下限 {DASHBOARD_MIN_STOCKS} 件）。docs/ は一切変更していません")
     usdjpy = _fetch_usdjpy()
     html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta, growth)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
