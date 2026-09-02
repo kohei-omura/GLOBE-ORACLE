@@ -20,7 +20,11 @@ def main() -> int:
         return 1
     cmd = sys.argv[1].strip().lower()
     if cmd == "report":
-        path = R.write_dashboard()
+        try:
+            path = R.write_dashboard()
+        except R.DashboardSkipped as e:
+            print(f"[globe] dashboard 更新を中止: {e}", file=sys.stderr)
+            return 2
         print(f"[globe] dashboard 生成完了: {path}")
         return 0
     if cmd == "prices":
