@@ -28,6 +28,11 @@
     return '$' + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
+  /* 銘柄名・理由などは外部データ由来。innerHTML に入れる前に必ずエスケープする */
+  function esc(x) {
+    return String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
   function norm(s) {
     s = (s == null ? '' : String(s));
     try { s = s.normalize('NFKC'); } catch (e) {}
@@ -42,11 +47,11 @@
 
   function badge(g) { var m = { BUY: ['買', 'buy'], SELL: ['売', 'sell'], HOLD: ['待', 'hold'] }; var x = m[g] || m.HOLD; return '<span class="badge ' + x[1] + '">' + x[0] + '</span>'; }
   function bar(sc) { var p = Math.max(-100, Math.min(100, sc)) / 100; if (p >= 0) return '<span class="bar"><span class="bar-pos" style="width:' + (p * 50) + '%"></span></span>'; return '<span class="bar"><span class="bar-neg" style="width:' + (Math.abs(p) * 50) + '%;margin-left:' + (50 - Math.abs(p) * 50) + '%"></span></span>'; }
-  function starBtn(c) { var on = inWatch(c); return '<button class="star' + (on ? ' on' : '') + '" data-star="' + c + '">' + (on ? '★' : '☆') + '</button>'; }
+  function starBtn(c) { var on = inWatch(c); return '<button class="star' + (on ? ' on' : '') + '" data-star="' + esc(c) + '">' + (on ? '★' : '☆') + '</button>'; }
 
   function card(s, mode) {
     var scls = s.sc >= 0 ? 'pos' : 'neg';
-    var seg = s.m ? '<span class="seg">' + s.m + '</span>' : '';
+    var seg = s.m ? '<span class="seg">' + esc(s.m) + '</span>' : '';
     var levels = '';
     if (s.t && s.st) {
       levels = '<div class="levels"><span class="lv tgt">利確 ' + fmtMoney(s.t) + '</span>' +
@@ -54,17 +59,20 @@
         (s.rr ? '<span class="lv rr">RR ' + s.rr + '</span>' : '') + '</div>';
     }
     var an = (s.tp != null) ? '<div class="analyst ' + (s.tp >= 0 ? 'up' : 'dn') + '">プロ予想 ' + (s.tp >= 0 ? '+' : '') + s.tp + '%</div>' : '';
-    var fair = (s.val) ? '<div class="fair ' + (s.val === '割安' ? 'up' : s.val === '割高' ? 'dn' : 'hold') + '">理論株価 <b>' + s.val + '</b>（' + (s.fg >= 0 ? '+' : '') + s.fg + '%）</div>' : '';
-    var reasons = (s.r && s.r.length) ? '<div class="reasons">' + s.r.map(function (r) { return '<span class="chip">' + r + '</span>'; }).join('') + '</div>' : '';
-    var rm = (mode === 'watch') ? '<button class="rm" data-rm="' + s.c + '">×</button>' : '';
+    var fair = (s.val) ? '<div class="fair ' + (s.val === '割安' ? 'up' : s.val === '割高' ? 'dn' : 'hold') + '">理論株価 <b>' + esc(s.val) + '</b>（' + (s.fg >= 0 ? '+' : '') + s.fg + '%）</div>' : '';
+    var reasons = (s.r && s.r.length) ? '<div class="reasons">' + s.r.map(function (r) { return '<span class="chip">' + esc(r) + '</span>'; }).join('') + '</div>' : '';
+    var c = esc(s.c);
+    var rm = (mode === 'watch') ? '<button class="rm" data-rm="' + c + '">×</button>' : '';
     return '<div class="card"><div class="row1"><span class="rank">' + (s.rk || '-') + '</span>' +
-      '<div class="title"><span class="code">' + s.c + '</span><span class="name">' + s.n + '</span>' + seg + '</div>' +
+      '<div class="title"><span class="code">' + c + '</span><span class="name">' + esc(s.n) + '</span>' + seg + '</div>' +
       badge(s.g) + starBtn(s.c) + rm + '</div>' +
-      '<div class="row2"><span class="price" data-px="' + s.c + '" data-usd="' + s.p + '">' + fmtMoney(s.p) + '</span>' +
+      '<div class="row2"><span class="price" data-px="' + c + '" data-usd="' + esc(s.p) + '">' + fmtMoney(s.p) + '</span>' +
       '<span class="score ' + scls + '">' + (s.sc >= 0 ? '+' : '') + s.sc + '</span>' + bar(s.sc) + '</div>' +
       levels + an + fair + reasons +
       '<div class="reasons"><span class="chip">スコア順 ' + (s.rk || '-') + ' 位 / ' + TOTAL + ' 銘柄</span></div></div>';
   }
+  /* 検索キー（社名＋ティッカー）はクライアントで生成してキャッシュ（stocks.json を軽くするため） */
+  function skey(s) { return s._k || (s._k = norm(s.n + ' ' + s.c)); }
   function byCode(c) { if (!STOCKS) return null; var v = String(c).toLowerCase(); for (var i = 0; i < STOCKS.length; i++) { if (STOCKS[i].c.toLowerCase() === v) return STOCKS[i]; } return null; }
 
   function ensureStocks(cb) {
@@ -89,8 +97,17 @@
     if (!raw) { results.innerHTML = ''; if (hint) hint.style.display = ''; if (hitEl) hitEl.textContent = ''; return; }
     if (hint) hint.style.display = 'none';
     if (!STOCKS) { if (hitEl) hitEl.textContent = ''; results.innerHTML = '<p class="empty">銘柄データを読込中…</p>'; ensureStocks(); return; }
-    var v = norm(raw), code = raw.toLowerCase();
-    var m = STOCKS.filter(function (s) { return (s.k && s.k.indexOf(v) >= 0) || s.c.toLowerCase().indexOf(code) === 0; }).sort(function (a, b) { return b.sc - a.sc; });
+    /* 1,800銘柄超ではスコア順だけだと "MU" 検索で MU 自体が9位以下に埋もれる。
+       ティッカー完全一致 → ティッカー前方一致 → 社名一致 の順に並べ、同グループ内はスコア順。
+       全角入力（ＮＶＤＡ）も NFKC で半角に揃えて照合する。 */
+    var v = norm(raw), hits = [];
+    for (var i = 0; i < STOCKS.length; i++) {
+      var s = STOCKS[i], c = s.c.toLowerCase(), g;
+      if (c === v) g = 0; else if (c.indexOf(v) === 0) g = 1; else if (skey(s).indexOf(v) >= 0) g = 2; else continue;
+      hits.push([g, s]);
+    }
+    hits.sort(function (a, b) { return a[0] - b[0] || b[1].sc - a[1].sc; });
+    var m = hits.map(function (x) { return x[1]; });
     var shown = m.slice(0, 8);
     if (hitEl) hitEl.textContent = m.length ? (m.length + '件ヒット / 上位' + shown.length + '件') : '';
     results.innerHTML = shown.length ? shown.map(function (s) { return card(s, 'search'); }).join('') : '<p class="empty">該当なし。社名(apple)やティッカー(AAPL)で検索してください。</p>';
@@ -216,7 +233,7 @@
   function init() {
     addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
-    refreshPrices(); tick();
+    tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();
