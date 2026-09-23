@@ -18,6 +18,7 @@ import re
 import sys
 import traceback
 from datetime import datetime, timezone, timedelta, date, time as dtime
+from functools import lru_cache
 from pathlib import Path
 
 try:
@@ -223,6 +224,7 @@ GROWTH_MCAP_MIN = 300_000_000          # 時価総額 $300M以上（超小型の
 GROWTH_VOL_MIN = 300_000               # 3ヶ月平均出来高 30万株以上（流動性）
 GROWTH_POOL_PER_SORT = 150             # スクリーナー（フォールバック時）1軸あたりの取得件数
 GROWTH_TOP_N = 5                       # 表示するランキング件数（1〜5位）
+GROWTH_CONFIRM_N = 40                  # Ticker.info で確認する上位候補数（時価総額・種別・業績）
 GROWTH_MAX_UNIVERSE = 9000             # 母集団の安全上限
 GROWTH_MAX_SCORE = 2500                # 1年日足を取って採点する上限（足切り後）
 GROWTH_POOL_REDUCED = {"reduced": False}
@@ -300,20 +302,69 @@ def fetch_universe() -> list[tuple[str, str, str]]:
 # ─────────────────────────────────────────────
 #  市場カレンダー（US Eastern基準・DSTはzoneinfoが処理）
 # ─────────────────────────────────────────────
-US_HOLIDAYS = {
-    # 2026
-    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
-    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
-    date(2026, 11, 26), date(2026, 12, 25),
-    # 2027
-    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 3, 26),
-    date(2027, 5, 31), date(2027, 6, 18), date(2027, 7, 5), date(2027, 9, 6),
-    date(2027, 11, 25), date(2027, 12, 24),
-}
-US_HALF_DAYS = {  # 13:00 ET 早引け
-    date(2026, 11, 27), date(2026, 12, 24),
-    date(2027, 11, 26), date(2027, 12, 24),
-}
+# NYSEの休場日・短縮取引日は規則から毎年計算する（以前は2026〜27年のハードコードで、
+# 2028年以降は祝日を営業日と誤判定するようになっていた）。
+# 規則で決まらない臨時休場（国葬など）だけ US_EXTRA_CLOSED に手で追加する。
+US_EXTRA_CLOSED: set[date] = set()
+
+
+def _nth_weekday(y: int, m: int, wd: int, nth: int) -> date:
+    """y年m月の第nth週の曜日wd（月=0）。nth=-1 で最終週。"""
+    if nth > 0:
+        d = date(y, m, 1)
+        return d + timedelta(days=(wd - d.weekday()) % 7 + 7 * (nth - 1))
+    d = date(y + (m == 12), m % 12 + 1, 1) - timedelta(days=1)
+    return d - timedelta(days=(d.weekday() - wd) % 7)
+
+
+def _easter(y: int) -> date:
+    """グレゴリオ暦の復活祭（Anonymous Gregorian algorithm）。"""
+    a, b, c = y % 19, y // 100, y % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    return date(y, month, (h + l - 7 * m + 114) % 31 + 1)
+
+
+def _observed(d: date) -> date:
+    """土曜の祝日は前の金曜、日曜の祝日は翌月曜に振替。"""
+    return d - timedelta(days=1) if d.weekday() == 5 else (
+        d + timedelta(days=1) if d.weekday() == 6 else d)
+
+
+@lru_cache(maxsize=None)
+def _us_holidays(y: int) -> frozenset:
+    hol = {
+        _nth_weekday(y, 1, 0, 3),                    # キング牧師記念日（1月第3月曜）
+        _nth_weekday(y, 2, 0, 3),                    # 大統領の日（2月第3月曜）
+        _easter(y) - timedelta(days=2),              # 聖金曜日
+        _nth_weekday(y, 5, 0, -1),                   # メモリアルデー（5月最終月曜）
+        _observed(date(y, 7, 4)),                    # 独立記念日
+        _nth_weekday(y, 9, 0, 1),                    # レイバーデー（9月第1月曜）
+        _nth_weekday(y, 11, 3, 4),                   # 感謝祭（11月第4木曜）
+        _observed(date(y, 12, 25)),                  # クリスマス
+    }
+    ny = date(y, 1, 1)
+    if ny.weekday() != 5:                            # 元日が土曜なら前年12/31は休まない（NYSE規則）
+        hol.add(_observed(ny))
+    if y >= 2022:
+        hol.add(_observed(date(y, 6, 19)))           # ジューンティーンス（2022年〜）
+    return frozenset(hol | {d for d in US_EXTRA_CLOSED if d.year == y})
+
+
+@lru_cache(maxsize=None)
+def _us_half_days(y: int) -> frozenset:
+    """13:00 ET 早引け：感謝祭翌日、平日(月〜木)の7/3とクリスマスイブ。"""
+    half = {_nth_weekday(y, 11, 3, 4) + timedelta(days=1)}
+    for d in (date(y, 7, 3), date(y, 12, 24)):
+        if d.weekday() <= 3:
+            half.add(d)
+    return frozenset(half - _us_holidays(y))
 
 
 def _et_now() -> datetime:
@@ -321,11 +372,11 @@ def _et_now() -> datetime:
 
 
 def _is_trading_day(d: date) -> bool:
-    return d.weekday() < 5 and d not in US_HOLIDAYS
+    return d.weekday() < 5 and d not in _us_holidays(d.year)
 
 
 def _session(d: date):
-    half = d in US_HALF_DAYS
+    half = d in _us_half_days(d.year)
     o = datetime.combine(d, dtime(9, 30), tzinfo=ET)
     c = datetime.combine(d, dtime(13, 0) if half else dtime(16, 0), tzinfo=ET)
     return o, c, half
@@ -432,7 +483,7 @@ class Analysis:
         self.ez = None
         self.fund = None
         self.bt = None
-        self.gr = None      # 大化け候補スコア（growth_score の戻り値）
+        self.gr = None      # 大化け候補の特徴量と点数（growth_features＋rank_growth）
 
 
 def _clip(v, lo, hi):
@@ -579,78 +630,125 @@ def barrier_stats(df: pd.DataFrame, price: float, tgt: float, stp: float) -> dic
         return None
 
 
-def growth_score(df: pd.DataFrame) -> dict | None:
-    """2桁株の「大化け候補」スコア（0〜100）と内訳を返す。band外・データ不足はNone。
+def growth_features(df: pd.DataFrame) -> dict | None:
+    """2桁株の「大化け候補」判定に使う生の特徴量を日足から計算する（採点は rank_growth）。
 
-    将来の上昇率を予測するものではない。SanDisk型の急騰局面に入った銘柄が
-    “入る前”に共通して示していた、日足だけで計測できる特徴を合成した相対値。
-      mom6   6ヶ月騰落率         … トレンドが既に効いているか  (0〜30点)
-      accel  3ヶ月 vs 6ヶ月      … 上昇が加速しているか        (0〜15点)
-      vsurge 直近20日÷以前5ヶ月  … 資金が入り始めているか      (0〜20点)
-      atrp   ATR14 ÷ 株価        … そもそも値幅を出せる銘柄か  (0〜15点)
-      nh     52週高値からの位置  … ブレイクアウト圏にいるか    (0〜20点)
+    固定閾値で点数化すると強い銘柄が軒並み満点に張り付き順位が付かなくなる（実運用で
+    TOP5が 85/85/85/84/84 に飽和）。ここでは特徴量だけを出し、母集団内の相対順位で採点する。
+    根拠のある特徴だけを使う：
+      rs_raw  3/6/9/12ヶ月の加重リターン（IBD型 RS。モメンタム継続効果）
+      nh      52週高値への近さ（George & Hwang 2004：高値圏ほど継続しやすい）
+      udv     上昇日出来高÷下落日出来高（50日）… 買い集め。単純な出来高急増は投げ売りでも立つ
+      vsurge  直近20日出来高÷それ以前 … 資金流入の始まり
+      atrp    ATR%（大化けには値幅を出せることが必要条件）
+      trend   Minervini のトレンドテンプレート（超上昇株の事前条件）の充足率
+      ext     50日線からの乖離（行き過ぎ＝既に走り切った可能性）
     """
     try:
         close = df["Close"].dropna()
-        if len(close) < 120:                      # 半年未満は判定材料が足りない
+        n = len(close)
+        if n < 120:                               # 半年未満は判定材料が足りない
             return None
         price = float(close.iloc[-1])
         if not (GROWTH_PX_MIN <= price < GROWTH_PX_MAX):   # 2桁株のみ
             return None
+        high = df["High"].reindex(close.index)
+        low = df["Low"].reindex(close.index)
 
-        def _chg(nbars: int):
-            if len(close) <= nbars:
+        def ret(nbars: int):
+            if n <= nbars:
                 return None
             base = float(close.iloc[-1 - nbars])
-            return (price / base - 1.0) * 100.0 if base > 0 else None
+            return price / base - 1.0 if base > 0 else None
 
-        mom3, mom6 = _chg(63), _chg(126)
-        base1y = float(close.iloc[0])
-        mom12 = (price / base1y - 1.0) * 100.0 if base1y > 0 else None
+        r63, r126, r189, r252 = ret(63), ret(126), ret(189), ret(min(252, n - 1))
+        parts = [(0.4, r63), (0.2, r126), (0.2, r189), (0.2, r252)]
+        wsum = sum(w for w, r in parts if r is not None)
+        rs_raw = sum(w * r for w, r in parts if r is not None) / wsum if wsum else None
 
-        atrp = None
-        a1 = float(_atr(df["High"], df["Low"], df["Close"], 14).iloc[-1])
-        if a1 == a1 and price > 0:                # NaNチェック
-            atrp = a1 / price * 100.0
+        base0 = float(close.iloc[0])
+        mom12 = (price / base0 - 1.0) * 100.0 if base0 > 0 else None
 
-        vsurge = None
+        hi52 = float(high.max()) if high.notna().any() else None
+        lo52 = float(low.min()) if low.notna().any() else None
+        nh = price / hi52 if hi52 and hi52 > 0 else None
+
+        a1 = float(_atr(high, low, close, 14).iloc[-1])
+        atrp = a1 / price * 100.0 if (a1 == a1 and price > 0) else None
+
+        vsurge = udv = None
         if "Volume" in df.columns:
-            v = df["Volume"].dropna()
-            if len(v) >= 126:
-                # 直近20日 ÷ それ以前の約5ヶ月平均。基準側に直近を含めると倍率が薄まるため除外。
+            v = df["Volume"].reindex(close.index).fillna(0.0)
+            if n >= 126:
                 v_base = float(v.iloc[-126:-20].mean())
                 if v_base > 0:
                     vsurge = float(v.iloc[-20:].mean()) / v_base
+            chg = close.diff().iloc[-50:]
+            vv = v.iloc[-50:]
+            up, dn = float(vv[chg > 0].sum()), float(vv[chg < 0].sum())
+            if up + dn > 0:
+                udv = min(up / dn, 5.0) if dn > 0 else 5.0
 
-        nh = None
-        hi = df["High"].dropna()
-        if len(hi):
-            hi52 = float(hi.max())                # 1年分の日足＝実質52週高値
-            if hi52 > 0:
-                nh = price / hi52 * 100.0
+        sma = {k: close.rolling(k).mean() for k in (50, 150, 200)}
+        s50, s150, s200 = (float(sma[k].iloc[-1]) if n >= k else None for k in (50, 150, 200))
+        checks: list[bool] = []
+        if s150 is not None and s200 is not None:
+            checks += [price > s150 and price > s200, s150 > s200]
+        if s200 is not None and n >= 221:
+            checks.append(s200 > float(sma[200].iloc[-22]))          # 200日線が1ヶ月以上上向き
+        if s50 is not None and s150 is not None and s200 is not None:
+            checks.append(s50 > s150 and s50 > s200)
+        if s50 is not None:
+            checks.append(price > s50)
+        if lo52:
+            checks.append(price >= 1.30 * lo52)                       # 52週安値から+30%以上
+        if hi52:
+            checks.append(price >= 0.75 * hi52)                       # 52週高値から-25%以内
+        trend_pass, trend_n = sum(checks), len(checks)
+        ext = price / s50 - 1.0 if s50 else None
 
-        sc = 0.0
-        if mom6 is not None:                      # 6ヶ月+100%で満点
-            sc += _clip(mom6 / 100.0, 0.0, 1.0) * 30.0
-        if mom3 is not None and mom6 is not None and mom6 > 0:
-            sc += _clip((mom3 / mom6 - 0.5) / 0.5, 0.0, 1.0) * 15.0
-        if vsurge is not None:                    # 出来高2倍で満点
-            sc += _clip(vsurge - 1.0, 0.0, 1.0) * 20.0
-        if atrp is not None:                      # ATR 2%→0点 / 6%で満点
-            sc += _clip((atrp - 2.0) / 4.0, 0.0, 1.0) * 15.0
-        if nh is not None:                        # 52週高値の95%以上で満点
-            sc += _clip((nh - 70.0) / 25.0, 0.0, 1.0) * 20.0
-
-        return {"score": round(sc, 1), "price": round(price, 2),
-                "mom3": None if mom3 is None else round(mom3, 1),
-                "mom6": None if mom6 is None else round(mom6, 1),
-                "mom12": None if mom12 is None else round(mom12, 1),
-                "vsurge": None if vsurge is None else round(vsurge, 2),
-                "atrp": None if atrp is None else round(atrp, 1),
-                "nh": None if nh is None else round(nh, 1)}
+        rnd = lambda x, d=1: None if x is None else round(x, d)
+        return {"price": round(price, 2), "bars": n, "short_hist": n < 240,
+                "rs_raw": rs_raw, "mom3": rnd(r63 * 100 if r63 is not None else None),
+                "mom6": rnd(r126 * 100 if r126 is not None else None), "mom12": rnd(mom12),
+                "nh": rnd(nh * 100 if nh is not None else None), "udv": rnd(udv, 2),
+                "vsurge": rnd(vsurge, 2), "atrp": rnd(atrp),
+                "trend_pass": trend_pass, "trend_n": trend_n,
+                "ext": rnd(ext * 100 if ext is not None else None)}
     except Exception as e:
-        print(f"[globe] growth_score失敗: {e}", file=sys.stderr)
+        print(f"[globe] growth_features失敗: {e}", file=sys.stderr)
         return None
+
+
+# テクニカル合成の重み（計85点）＋トレンドテンプレート15点
+_GROWTH_W = {"rs_raw": 0.30, "nh": 0.20, "udv": 0.15, "vsurge": 0.10, "atrp": 0.10}
+
+
+def rank_growth(feats: dict[str, dict]) -> None:
+    """母集団内の相対順位（パーセンタイル）でテクニカル点を付ける。feats を直接更新する。
+
+    欠損した特徴は中立(0.5)扱い。50日線から+50%を超える過熱は最大3割減点する。
+    付与するキー: rs（1〜99のRSレーティング）, tech（0〜100）, score（=tech。確認段階で上書き）
+    """
+    if not feats:
+        return
+    codes = list(feats)
+
+    def pct(key: str) -> pd.Series:
+        v = pd.Series({c: feats[c].get(key) for c in codes}, dtype="float64")
+        return v.rank(pct=True).fillna(0.5)
+
+    tech = sum(w * pct(k) for k, w in _GROWTH_W.items()) * 100.0
+    trend = pd.Series({c: (feats[c]["trend_pass"] / feats[c]["trend_n"]) if feats[c]["trend_n"]
+                       else 0.5 for c in codes})
+    tech = tech + 15.0 * trend
+    ext = pd.Series({c: (feats[c].get("ext") or 0.0) / 100.0 for c in codes})
+    tech = tech * (1.0 - (ext - 0.5).clip(lower=0.0) * 0.6).clip(lower=0.7)
+    p_rs = pct("rs_raw")
+    for c in codes:
+        feats[c]["rs"] = int(round(1 + 98 * float(p_rs[c])))
+        feats[c]["tech"] = round(float(tech[c]), 1)
+        feats[c]["score"] = feats[c]["tech"]
 
 
 # ─────────────────────────────────────────────
@@ -853,9 +951,17 @@ def _screen_pool() -> list[dict]:
 
 
 _TICKER_RE = re.compile(r"[A-Z]{1,5}([.-][A-Z]{1,2})?$")
-# 普通株以外（ワラント／新株予約権／ユニット／優先株／預託証券／社債）を名称から除外する語
-_NON_COMMON_WORDS = ("warrant", " right", "rights", " unit", "units", "preferred",
-                     "depositary", "notes due", "debenture", "when issued", "%")
+# 普通株（ADR含む）以外を銘柄名から除外する。大化け候補の母集団に不要なもの：
+#   ワラント/権利/ユニット/優先株/社債 … 普通株ではない
+#   ファンド(CEF・BDC)/ETN/地方債 … ETFフラグが立たないため素通りしていた（VXX等）
+#   SPAC（Acquisition Corp）… $10近辺で動かない箱
+# ※「depositary」は ADR（American Depositary Shares）まで落とすため使わない。
+#   優先株の預託証券は記号（ACTの$/NASDAQの-サフィックス）と "preferred" で除外できる。
+_NON_COMMON_RE = re.compile(
+    r"\b(warrants?|rights?|units?|preferred|preference|notes?\s+due|debentures?|"
+    r"when[\s-]issued|fund|etns?|exchange[\s-]traded|municipal|"
+    r"acquisition\s+(corp|corporation|co|company)|blank\s+check)\b|%",
+    re.I)
 
 
 def _http_text(url: str, timeout: int = 30) -> str | None:
@@ -878,8 +984,7 @@ def _is_common_stock(sym: str, name: str) -> bool:
     """ティッカーと銘柄名から「普通株らしさ」を判定（ワラント/ユニット/優先株等を除外）。"""
     if not sym or not _TICKER_RE.fullmatch(sym.strip().upper()):
         return False
-    low = f" {(name or '').lower()} "
-    return not any(w in low for w in _NON_COMMON_WORDS)
+    return not _NON_COMMON_RE.search(name or "")
 
 
 def _parse_symbol_dir(text: str) -> list[tuple[str, str]]:
@@ -893,6 +998,10 @@ def _parse_symbol_dir(text: str) -> list[tuple[str, str]]:
     for row in csv.DictReader(io.StringIO(text), delimiter="|"):
         raw = (row.get("NASDAQ Symbol") or row.get("Symbol") or row.get("ACT Symbol") or "").strip()
         if not raw or raw.startswith("File Creation Time"):
+            continue
+        # 優先株：ACT Symbol は "MS$F"、NASDAQ統合シンボルは "MS-F"（クラス株は "BRK.B" のドット）。
+        # 実運用で MS-F / MS-A / SCE-L / MER-K が混入し日足取得に失敗していた。
+        if "$" in (row.get("ACT Symbol") or "") or "-" in raw:
             continue
         if (row.get("Test Issue") or "N").strip().upper() == "Y":     # テスト銘柄
             continue
@@ -1067,6 +1176,82 @@ def _growth_pool() -> list[dict]:
         GROWTH_UNIVERSE_SRC.update(src="内蔵シードリスト", n_universe=len(pool), n_scored=len(pool))
     print(f"growth pool: {len(pool)} reduced={GROWTH_POOL_REDUCED['reduced']}", file=sys.stderr)
     return pool
+
+
+def _growth_confirm(codes: list[str]) -> dict[str, dict]:
+    """上位候補だけ Ticker.info を取り、時価総額・証券種別・業績の伸びを確認する。
+
+    日足だけでは時価総額が分からず、GROWTH_MCAP_MIN（超小型株の除外）が効いていなかった。
+    全銘柄に info を叩くのは重すぎるため、テクニカル上位 GROWTH_CONFIRM_N 件に限る。
+    取得できなかった銘柄は結果に含めない（呼び出し側で扱いを決める）。
+    """
+    if not codes:
+        return {}
+    import yfinance as yf
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(c: str):
+        try:
+            info = yf.Ticker(c).info or {}
+        except Exception as e:
+            print(f"[globe] 大化け候補info失敗 {c}: {e}", file=sys.stderr)
+            return c, None
+        if not info:
+            return c, None
+        return c, {"mcap": info.get("marketCap"),
+                   "qtype": str(info.get("quoteType") or "").upper(),
+                   "sector": info.get("sector") or "",
+                   "rev_g": info.get("revenueGrowth"),
+                   "eps_g": info.get("earningsQuarterlyGrowth"),
+                   "name": info.get("shortName") or info.get("longName") or ""}
+
+    out: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=4) as ex:      # 4並列（Yahooのレート制限に配慮）
+        for c, d in ex.map(one, codes):
+            if d:
+                out[c] = d
+    print(f"growth confirm: {len(out)}/{len(codes)} 銘柄の info を取得", file=sys.stderr)
+    return out
+
+
+def _select_growth(cands: list[str], feats: dict[str, dict], conf: dict[str, dict]) -> list[str]:
+    """確認結果で除外・加点して最終順位を返す（cands はテクニカル順）。
+
+    除外: 普通株以外（quoteType≠EQUITY）、時価総額 GROWTH_MCAP_MIN 未満、info未取得。
+    加点: 売上成長率(60%)・四半期EPS成長率(40%)の候補内パーセンタイル → 最終 = 技術75% + 業績25%。
+    info がほぼ取れない（半分未満）ときはネットワーク障害とみなし、除外せずテクニカル順で返す。
+    """
+    if len(conf) < max(1, len(cands) // 2):
+        GROWTH_UNIVERSE_SRC["confirmed"] = False
+        return list(cands)
+    GROWTH_UNIVERSE_SRC["confirmed"] = True
+    keep = []
+    for c in cands:
+        d = conf.get(c)
+        if d is None:
+            continue
+        if d["qtype"] and d["qtype"] != "EQUITY":
+            continue
+        if d["mcap"] is not None and d["mcap"] < GROWTH_MCAP_MIN:
+            continue
+        keep.append(c)
+    if not keep:
+        return []
+
+    def pct(key: str, lo: float, hi: float) -> pd.Series:
+        v = pd.Series({c: conf[c].get(key) for c in keep}, dtype="float64").clip(lo, hi)
+        return v.rank(pct=True).fillna(0.5)
+
+    fund = (0.6 * pct("rev_g", -1.0, 5.0) + 0.4 * pct("eps_g", -1.0, 10.0)) * 100.0
+    for c in keep:
+        f, d = feats[c], conf[c]
+        f["fund"] = round(float(fund[c]), 1)
+        f["score"] = round(0.75 * f["tech"] + 0.25 * f["fund"], 1)
+        f["mcap"] = d["mcap"] or 0
+        f["sector"] = d["sector"]
+        f["rev_g"] = None if d["rev_g"] is None else round(d["rev_g"] * 100.0, 0)
+        f["name"] = d["name"]
+    return sorted(keep, key=lambda c: (-feats[c]["score"], c))
 
 
 def _eval_criteria(code: str, mcap_hint: float) -> tuple[dict, float, str]:
@@ -1269,35 +1454,41 @@ def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict, l
         need = [c for c in gmeta if c not in frames]
         if need:
             frames.update(_download_batch(need, "1y"))
-        scored: list[tuple[float, str, dict]] = []
+        feats: dict[str, dict] = {}
         for c in gmeta:
             df = frames.get(c)
-            if df is None:
-                continue
-            gr = growth_score(df)
-            if gr:
-                scored.append((gr["score"], c, gr))
-        # 同点はティッカー順で決定的に（日々の並びが無意味に入れ替わらないように）
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        amap_g = {a.code: a for a in analyses}
+            f = growth_features(df) if df is not None else None
+            if f:
+                feats[c] = f
+        rank_growth(feats)                                   # 母集団内の相対順位で採点
+        order = sorted(feats, key=lambda c: (-feats[c]["tech"], c))
+        shortlist = order[:GROWTH_CONFIRM_N]
+        top = _select_growth(shortlist, feats, _growth_confirm(shortlist))[:GROWTH_TOP_N]
+
         # 採点した銘柄はすべて検索対象(analyses)に合流させる。1年日足は取得済みなので
         # 追加の通信は発生せず、テクニカル計算だけで検索できる銘柄が数倍になる。
-        for _sc, c, gr in scored:
-            a = amap_g.get(c)
-            if a is None:
-                a = _analysis_from_frame(c, gmeta[c].get("n") or c, frames[c])
-                if a is None:
-                    continue
+        amap_g = {a.code: a for a in analyses}
+        for c in order:
+            if c in amap_g:
+                continue
+            nm = feats[c].get("name") or gmeta[c].get("n") or c
+            a = _analysis_from_frame(c, nm, frames[c], feats[c].get("sector") or "")
+            if a is not None:
                 analyses.append(a)
                 amap_g[c] = a
-            if len(growth) < GROWTH_TOP_N:      # scoredはスコア降順なので先頭から上位
-                gr["mcap"] = gmeta[c].get("mcap") or 0
-                a.gr = gr
-                growth.append(a)
-        print(f"growth: 採点{len(scored)}銘柄を検索対象に合流 / TOP{len(growth)}を表示",
+        for c in top:
+            a = amap_g.get(c)
+            if a is None:
+                continue
+            a.gr = feats[c]
+            if not a.sector and feats[c].get("sector"):
+                a.sector = feats[c]["sector"]
+            growth.append(a)
+        print(f"growth: 採点{len(order)}銘柄を検索対象に合流 / 確認{len(shortlist)} → TOP{len(growth)}",
               file=sys.stderr)
     except Exception as e:
         print(f"[globe] 大化け候補レーダー失敗: {e}", file=sys.stderr)
+        traceback.print_exc()
 
     analyses.sort(key=lambda x: x.sc, reverse=True)
     meta = market_window()
@@ -1311,10 +1502,6 @@ def _esc(s) -> str:
     return (str("" if s is None else s)
             .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             .replace('"', "&quot;").replace("'", "&#39;"))
-
-
-def _search_key(name: str, code: str) -> str:
-    return f"{name} {code}".lower()
 
 
 def _sector_short(sec: str) -> str:
@@ -1462,23 +1649,36 @@ def _growth_card(rank: int, a: Analysis) -> str:
     def _pct(v) -> str:
         return "—" if v is None else f'{"+" if v >= 0 else ""}{v:.0f}%'
 
-    chips = [f'1年 {_pct(gr.get("mom12"))}', f'6ヶ月 {_pct(gr.get("mom6"))}']
+    chips = [f'RS {gr["rs"]}' if gr.get("rs") else "RS —"]
+    if gr.get("trend_n"):
+        chips.append(f'トレンド ✓{gr["trend_pass"]}/{gr["trend_n"]}')
+    # 上場1年未満は「1年」ではなく上場来の騰落率（ラベルを偽らない）
+    chips.append(f'{"上場来" if gr.get("short_hist") else "1年"} {_pct(gr.get("mom12"))}')
+    chips.append(f'6ヶ月 {_pct(gr.get("mom6"))}')
+    if gr.get("rev_g") is not None:
+        chips.append(f'売上 {_pct(gr["rev_g"])}')
+    chips.append(f'買い集め {gr["udv"]:.1f}倍' if gr.get("udv") else "買い集め —")
     chips.append(f'出来高 {gr["vsurge"]:.1f}倍' if gr.get("vsurge") else "出来高 —")
     chips.append(f'ATR {gr["atrp"]:.1f}%' if gr.get("atrp") else "ATR —")
     chips.append(f'52週高値比 {gr["nh"]:.0f}%' if gr.get("nh") else "52週高値比 —")
     chips_html = '<div class="reasons">' + "".join(
         f'<span class="chip">{_esc(c)}</span>' for c in chips) + "</div>"
-    mcap = f'<span class="seg">時価総額 ${gr["mcap"]/1e9:.1f}B</span>' if gr.get("mcap") else ""
+    warn = ""
+    if (gr.get("ext") or 0) > 50:
+        warn = (f'<div class="pl dn">⚠ 50日線から+{gr["ext"]:.0f}%乖離（過熱・急落リスク大）</div>')
+    seg = _sector_short(a.sector)
+    tags = (f'<span class="seg">{_esc(seg)}</span>' if seg else "") + (
+        f'<span class="seg">時価総額 ${gr["mcap"]/1e9:.1f}B</span>' if gr.get("mcap") else "")
     gsc = float(gr.get("score") or 0.0)
     return (
         f'<div class="card"><div class="row1"><span class="rank">{rank}</span>'
         f'<div class="title"><span class="code">{_esc(a.code)}</span>'
-        f'<span class="name">{_esc(a.name)}</span>{mcap}</div>{_badge(a.g)}</div>'
+        f'<span class="name">{_esc(a.name)}</span>{tags}</div>{_badge(a.g)}</div>'
         f'<div class="row2">'
         f'<span class="price" data-px="{_esc(a.code)}" data-usd="{a.price}">{_usd(a.price)}</span>'
         f'<span class="gscore">爆発力 {gsc:.0f}</span>'
         f'<span class="bar"><span class="bar-g" style="width:{_clip(gsc, 0.0, 100.0):.0f}%"></span></span>'
-        f'</div>{chips_html}</div>'
+        f'</div>{chips_html}{warn}</div>'
     )
 
 
@@ -1490,17 +1690,21 @@ def _growth_section(growth: list[Analysis] | None) -> str:
                if GROWTH_POOL_REDUCED.get("reduced") else "")
     src = GROWTH_UNIVERSE_SRC.get("src") or "—"
     n_uni, n_sc = GROWTH_UNIVERSE_SRC.get("n_universe", 0), GROWTH_UNIVERSE_SRC.get("n_scored", 0)
+    conf = (f'上位{GROWTH_CONFIRM_N}銘柄は時価総額${GROWTH_MCAP_MIN/1e6:.0f}M以上・普通株であることを確認し、'
+            f'売上・利益の伸びを25%加味しています。'
+            if GROWTH_UNIVERSE_SRC.get("confirmed") else
+            '<span style="color:var(--dn)">⚠ 銘柄情報を取得できず、時価総額・業績の確認を省略しています。</span>')
     foot = (f'<p class="cfoot">{reduced}母集団：{_esc(src)} <b>{n_uni:,}銘柄</b> → '
             f'株価 ${GROWTH_PX_MIN:.0f}〜${GROWTH_PX_MAX:.0f}未満（2桁株）・'
             f'平均出来高 {GROWTH_VOL_MIN:,}株超で <b>{n_sc:,}銘柄</b>に絞り、'
-            f'「6ヶ月モメンタム／上昇の加速／出来高急増／ATR（値幅）／52週高値からの位置」の5要素で'
-            f'採点した上位{GROWTH_TOP_N}銘柄です。'
+            f'RS（相対的強さ）・52週高値への近さ・買い集め・出来高急増・値幅(ATR)を母集団内の順位で採点し、'
+            f'トレンドテンプレート充足度を加点、50日線から大きく乖離した過熱銘柄は減点。{conf}'
             f'<br><b style="color:var(--dn)">これは「1年で30〜40倍になる銘柄」を予測するものではありません。</b>'
-            f'SanDisk型の急騰局面に入った銘柄が事前に示していた特徴を並べているだけで、'
+            f'急騰局面に入った銘柄が事前に示しやすい特徴を並べているだけで、'
             f'同じ特徴を持つ銘柄の大半は大化けせず、高ボラティリティは下落幅も大きいことを意味します。'
             f'1銘柄への集中投資は避けてください。</p>')
     return (f'<section class="sec"><h2 class="find"><span>🚀 大化け候補レーダー（2桁株）TOP{GROWTH_TOP_N}</span>'
-            f'<em>高ボラ×出来高急増×高値圏</em></h2><div class="cards">{cards}</div>{foot}</section>')
+            f'<em>RS×高値圏×買い集め×業績</em></h2><div class="cards">{cards}</div>{foot}</section>')
 
 
 CSS_STR = r"""
@@ -1574,7 +1778,7 @@ border-radius:8px;padding:1px 6px;margin-left:6px}
 .fair.up b{color:var(--up)}.fair.dn b{color:var(--dn)}.fair.hold b{color:var(--gold)}
 .pl{margin-top:8px;font-size:13px;font-weight:800}
 .pl.up{color:var(--up)}.pl.dn{color:var(--dn)}
-.hold-sum{margin:0 0 10px;padding:10px 13px;border:1px solid var(--line);border-radius:12px;background:var(--card);font-size:13px;color:var(--ink)}
+.hold-sum{margin:0 0 10px;padding:10px 13px;border:1px solid var(--line);border-radius:12px;background:var(--card);font-size:13px;color:var(--fg)}
 .hold-sum b.up{color:var(--up)}.hold-sum b.dn{color:var(--dn)}
 .hold-sum-note{color:var(--mut);font-size:10.5px;margin-left:6px}
 .hnote{font-size:11px;color:var(--mut);margin-left:8px;font-weight:600}
@@ -1625,6 +1829,11 @@ APP_JS = r"""
     return '$' + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
+  /* 銘柄名・理由などは外部データ由来。innerHTML に入れる前に必ずエスケープする */
+  function esc(x) {
+    return String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
   function norm(s) {
     s = (s == null ? '' : String(s));
     try { s = s.normalize('NFKC'); } catch (e) {}
@@ -1639,11 +1848,11 @@ APP_JS = r"""
 
   function badge(g) { var m = { BUY: ['買', 'buy'], SELL: ['売', 'sell'], HOLD: ['待', 'hold'] }; var x = m[g] || m.HOLD; return '<span class="badge ' + x[1] + '">' + x[0] + '</span>'; }
   function bar(sc) { var p = Math.max(-100, Math.min(100, sc)) / 100; if (p >= 0) return '<span class="bar"><span class="bar-pos" style="width:' + (p * 50) + '%"></span></span>'; return '<span class="bar"><span class="bar-neg" style="width:' + (Math.abs(p) * 50) + '%;margin-left:' + (50 - Math.abs(p) * 50) + '%"></span></span>'; }
-  function starBtn(c) { var on = inWatch(c); return '<button class="star' + (on ? ' on' : '') + '" data-star="' + c + '">' + (on ? '★' : '☆') + '</button>'; }
+  function starBtn(c) { var on = inWatch(c); return '<button class="star' + (on ? ' on' : '') + '" data-star="' + esc(c) + '">' + (on ? '★' : '☆') + '</button>'; }
 
   function card(s, mode) {
     var scls = s.sc >= 0 ? 'pos' : 'neg';
-    var seg = s.m ? '<span class="seg">' + s.m + '</span>' : '';
+    var seg = s.m ? '<span class="seg">' + esc(s.m) + '</span>' : '';
     var levels = '';
     if (s.t && s.st) {
       levels = '<div class="levels"><span class="lv tgt">利確 ' + fmtMoney(s.t) + '</span>' +
@@ -1651,17 +1860,20 @@ APP_JS = r"""
         (s.rr ? '<span class="lv rr">RR ' + s.rr + '</span>' : '') + '</div>';
     }
     var an = (s.tp != null) ? '<div class="analyst ' + (s.tp >= 0 ? 'up' : 'dn') + '">プロ予想 ' + (s.tp >= 0 ? '+' : '') + s.tp + '%</div>' : '';
-    var fair = (s.val) ? '<div class="fair ' + (s.val === '割安' ? 'up' : s.val === '割高' ? 'dn' : 'hold') + '">理論株価 <b>' + s.val + '</b>（' + (s.fg >= 0 ? '+' : '') + s.fg + '%）</div>' : '';
-    var reasons = (s.r && s.r.length) ? '<div class="reasons">' + s.r.map(function (r) { return '<span class="chip">' + r + '</span>'; }).join('') + '</div>' : '';
-    var rm = (mode === 'watch') ? '<button class="rm" data-rm="' + s.c + '">×</button>' : '';
+    var fair = (s.val) ? '<div class="fair ' + (s.val === '割安' ? 'up' : s.val === '割高' ? 'dn' : 'hold') + '">理論株価 <b>' + esc(s.val) + '</b>（' + (s.fg >= 0 ? '+' : '') + s.fg + '%）</div>' : '';
+    var reasons = (s.r && s.r.length) ? '<div class="reasons">' + s.r.map(function (r) { return '<span class="chip">' + esc(r) + '</span>'; }).join('') + '</div>' : '';
+    var c = esc(s.c);
+    var rm = (mode === 'watch') ? '<button class="rm" data-rm="' + c + '">×</button>' : '';
     return '<div class="card"><div class="row1"><span class="rank">' + (s.rk || '-') + '</span>' +
-      '<div class="title"><span class="code">' + s.c + '</span><span class="name">' + s.n + '</span>' + seg + '</div>' +
+      '<div class="title"><span class="code">' + c + '</span><span class="name">' + esc(s.n) + '</span>' + seg + '</div>' +
       badge(s.g) + starBtn(s.c) + rm + '</div>' +
-      '<div class="row2"><span class="price" data-px="' + s.c + '" data-usd="' + s.p + '">' + fmtMoney(s.p) + '</span>' +
+      '<div class="row2"><span class="price" data-px="' + c + '" data-usd="' + esc(s.p) + '">' + fmtMoney(s.p) + '</span>' +
       '<span class="score ' + scls + '">' + (s.sc >= 0 ? '+' : '') + s.sc + '</span>' + bar(s.sc) + '</div>' +
       levels + an + fair + reasons +
       '<div class="reasons"><span class="chip">スコア順 ' + (s.rk || '-') + ' 位 / ' + TOTAL + ' 銘柄</span></div></div>';
   }
+  /* 検索キー（社名＋ティッカー）はクライアントで生成してキャッシュ（stocks.json を軽くするため） */
+  function skey(s) { return s._k || (s._k = norm(s.n + ' ' + s.c)); }
   function byCode(c) { if (!STOCKS) return null; var v = String(c).toLowerCase(); for (var i = 0; i < STOCKS.length; i++) { if (STOCKS[i].c.toLowerCase() === v) return STOCKS[i]; } return null; }
 
   function ensureStocks(cb) {
@@ -1686,8 +1898,17 @@ APP_JS = r"""
     if (!raw) { results.innerHTML = ''; if (hint) hint.style.display = ''; if (hitEl) hitEl.textContent = ''; return; }
     if (hint) hint.style.display = 'none';
     if (!STOCKS) { if (hitEl) hitEl.textContent = ''; results.innerHTML = '<p class="empty">銘柄データを読込中…</p>'; ensureStocks(); return; }
-    var v = norm(raw), code = raw.toLowerCase();
-    var m = STOCKS.filter(function (s) { return (s.k && s.k.indexOf(v) >= 0) || s.c.toLowerCase().indexOf(code) === 0; }).sort(function (a, b) { return b.sc - a.sc; });
+    /* 1,800銘柄超ではスコア順だけだと "MU" 検索で MU 自体が9位以下に埋もれる。
+       ティッカー完全一致 → ティッカー前方一致 → 社名一致 の順に並べ、同グループ内はスコア順。
+       全角入力（ＮＶＤＡ）も NFKC で半角に揃えて照合する。 */
+    var v = norm(raw), hits = [];
+    for (var i = 0; i < STOCKS.length; i++) {
+      var s = STOCKS[i], c = s.c.toLowerCase(), g;
+      if (c === v) g = 0; else if (c.indexOf(v) === 0) g = 1; else if (skey(s).indexOf(v) >= 0) g = 2; else continue;
+      hits.push([g, s]);
+    }
+    hits.sort(function (a, b) { return a[0] - b[0] || b[1].sc - a[1].sc; });
+    var m = hits.map(function (x) { return x[1]; });
     var shown = m.slice(0, 8);
     if (hitEl) hitEl.textContent = m.length ? (m.length + '件ヒット / 上位' + shown.length + '件') : '';
     results.innerHTML = shown.length ? shown.map(function (s) { return card(s, 'search'); }).join('') : '<p class="empty">該当なし。社名(apple)やティッカー(AAPL)で検索してください。</p>';
@@ -1813,7 +2034,7 @@ APP_JS = r"""
   function init() {
     addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
-    refreshPrices(); tick();
+    tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();
@@ -1898,7 +2119,7 @@ def _to_stock_json(a: Analysis, rank: int) -> dict:
     val = a.fund.get("valuation") if a.fund else None
     fg = a.fund.get("fair_gap") if a.fund else None
     return {
-        "c": a.code, "n": a.name, "k": _search_key(a.name, a.code),
+        "c": a.code, "n": a.name,
         "p": a.price, "sc": a.sc, "g": a.g, "m": _sector_short(a.sector),
         "t": a.tgt, "st": a.stp, "rr": a.rr, "r": a.reasons, "tp": tp,
         "val": val, "fg": fg, "rk": rank,
@@ -2079,7 +2300,9 @@ def write_dashboard() -> Path:
     html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta, growth)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
     (DOCS / "app.js").write_text(APP_JS, encoding="utf-8")
-    (DOCS / "stocks.json").write_text(json.dumps(stocks, ensure_ascii=False), encoding="utf-8")
+    # 区切りの空白を詰め、検索キーはクライアント生成にして転送量を削減（1,800銘柄超で約500KB）
+    (DOCS / "stocks.json").write_text(json.dumps(stocks, ensure_ascii=False, separators=(",", ":")),
+                                      encoding="utf-8")
     # 候補レーダー: candidates.json（NEW差分は screen_candidates で付与済み）
     cand_out = {"asof": cmeta.get("asof"), "threshold": cmeta.get("threshold", SP500_MCAP_MIN),
                 "reduced": cmeta.get("reduced", False),
