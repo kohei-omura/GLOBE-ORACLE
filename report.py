@@ -1183,34 +1183,36 @@ def _growth_confirm(codes: list[str]) -> dict[str, dict]:
 
     日足だけでは時価総額が分からず、GROWTH_MCAP_MIN（超小型株の除外）が効いていなかった。
     全銘柄に info を叩くのは重すぎるため、テクニカル上位 GROWTH_CONFIRM_N 件に限る。
-    取得できなかった銘柄は結果に含めない（呼び出し側で扱いを決める）。
+
+    逐次で取得する。4並列にしたところ Yahoo の crumb が衝突して 401（Invalid Crumb）が
+    多発し、yfinance は例外を出さずに中身の乏しい dict を返したため、40/40 成功と数えた
+    まま時価総額も業績も空になっていた（2026-09-23 run #92）。実データの目印
+    （quoteType か marketCap）が無い応答は失敗として1回だけ再試行し、ダメなら結果に含めない。
     """
     if not codes:
         return {}
+    import time as _t
     import yfinance as yf
-    from concurrent.futures import ThreadPoolExecutor
-
-    def one(c: str):
-        try:
-            info = yf.Ticker(c).info or {}
-        except Exception as e:
-            print(f"[globe] 大化け候補info失敗 {c}: {e}", file=sys.stderr)
-            return c, None
-        if not info:
-            return c, None
-        return c, {"mcap": info.get("marketCap"),
-                   "qtype": str(info.get("quoteType") or "").upper(),
-                   "sector": info.get("sector") or "",
-                   "rev_g": info.get("revenueGrowth"),
-                   "eps_g": info.get("earningsQuarterlyGrowth"),
-                   "name": info.get("shortName") or info.get("longName") or ""}
-
     out: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=4) as ex:      # 4並列（Yahooのレート制限に配慮）
-        for c, d in ex.map(one, codes):
-            if d:
-                out[c] = d
-    print(f"growth confirm: {len(out)}/{len(codes)} 銘柄の info を取得", file=sys.stderr)
+    for c in codes:
+        for attempt in range(2):
+            try:
+                info = yf.Ticker(c).info or {}
+            except Exception as e:
+                if attempt == 1:
+                    print(f"[globe] 大化け候補info失敗 {c}: {e}", file=sys.stderr)
+                info = {}
+            if info.get("quoteType") or info.get("marketCap"):
+                out[c] = {"mcap": info.get("marketCap"),
+                          "qtype": str(info.get("quoteType") or "").upper(),
+                          "sector": info.get("sector") or "",
+                          "rev_g": info.get("revenueGrowth"),
+                          "eps_g": info.get("earningsQuarterlyGrowth"),
+                          "name": info.get("shortName") or info.get("longName") or ""}
+                break
+            if attempt == 0:
+                _t.sleep(1.0)
+    print(f"growth confirm: {len(out)}/{len(codes)} 銘柄の info を取得（実データあり）", file=sys.stderr)
     return out
 
 
