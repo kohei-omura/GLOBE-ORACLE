@@ -1205,8 +1205,11 @@ def _reset_yf_session() -> bool:
         return False
 
 
-GROWTH_CONFIRM_WAITS = (0, 30, 60)     # 各パス前の待機秒（Yahooのレート制限が解けるのを待つ）
+GROWTH_CONFIRM_WAITS = (0, 30)         # 大量取得後の確認: 1回目＋30秒待って1回だけ再試行
 GROWTH_CONFIRM_ABORT = 5               # 連続でこの件数失敗したらそのパスを打ち切る（叩き続けると制限が延びる）
+GROWTH_INFO_FILE = DOCS / "growth_info.json"   # 先読みした info の保存先（dashboard と一緒にコミットされる）
+GROWTH_INFO_TTL_DAYS = 14              # 保存した info の有効期間（時価総額・業績はこの程度なら大きく変わらない）
+GROWTH_PREFETCH_N = 80                 # 次回の実行冒頭に先読みする件数（前回のテクニカル上位）
 
 
 def _info_one(yf, code: str) -> dict | None:
@@ -1225,28 +1228,19 @@ def _info_one(yf, code: str) -> dict | None:
             "name": info.get("shortName") or info.get("longName") or ""}
 
 
-def _growth_confirm(codes: list[str]) -> dict[str, dict]:
-    """上位候補だけ Ticker.info を取り、時価総額・証券種別・業績の伸びを確認する。
-
-    数千銘柄の日足を取った直後は Yahoo がこの IP を一時的に制限し、crumb 取得が
-    429、以降の info が 401 になる（2026-09-23 run #94: セッション再作成直後に 429、
-    約45秒後から成功し 15/40）。そこで:
-      - 各パスの前にセッションを作り直し、2パス目以降は待機してから未取得分だけ再試行
-      - 連続 GROWTH_CONFIRM_ABORT 件失敗したらそのパスを打ち切る（叩き続けない）
-    取得できなかった銘柄は結果に含めない。
-    """
+def _info_passes(codes: list[str], waits=GROWTH_CONFIRM_WAITS) -> dict[str, dict]:
+    """codes の info を取る。各パス前にセッションを作り直し、連続失敗で打ち切って次のパスへ。"""
     if not codes:
         return {}
     import time as _t
     import yfinance as yf
     out: dict[str, dict] = {}
     pending = list(codes)
-    for n, wait in enumerate(GROWTH_CONFIRM_WAITS, 1):
+    for n, wait in enumerate(waits, 1):
         if not pending:
             break
         if wait:
-            print(f"growth confirm: 未取得{len(pending)}銘柄 → {wait}秒待って再試行（{n}回目）",
-                  file=sys.stderr)
+            print(f"growth info: 未取得{len(pending)}銘柄 → {wait}秒待って再試行（{n}回目）", file=sys.stderr)
             _t.sleep(wait)
         _reset_yf_session()
         failed: list[str] = []
@@ -1263,7 +1257,66 @@ def _growth_confirm(codes: list[str]) -> dict[str, dict]:
                 failed.extend(pending[i + 1:])
                 break
         pending = failed
-    print(f"growth confirm: {len(out)}/{len(codes)} 銘柄の info を取得（実データあり）", file=sys.stderr)
+    return out
+
+
+def _load_growth_info() -> dict:
+    """保存済みの {shortlist, info} を読む。期限切れの info は捨てる。壊れていれば空。"""
+    try:
+        d = json.loads(GROWTH_INFO_FILE.read_text(encoding="utf-8"))
+        cutoff = (datetime.now(tz=JST) - timedelta(days=GROWTH_INFO_TTL_DAYS)).timestamp()
+        info = {c: v for c, v in (d.get("info") or {}).items()
+                if isinstance(v, dict) and float(v.get("ts", 0)) >= cutoff}
+        return {"shortlist": [c for c in (d.get("shortlist") or []) if isinstance(c, str)], "info": info}
+    except Exception:
+        return {"shortlist": [], "info": {}}
+
+
+def _save_growth_info(shortlist: list[str], info: dict[str, dict]) -> None:
+    try:
+        GROWTH_INFO_FILE.write_text(json.dumps(
+            {"asof": datetime.now(tz=JST).strftime("%Y-%m-%d %H:%M"),
+             "shortlist": shortlist, "info": info},
+            ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    except Exception as e:
+        print(f"[globe] {GROWTH_INFO_FILE.name} 保存失敗: {e}", file=sys.stderr)
+
+
+def _prefetch_growth_info() -> dict[str, dict]:
+    """前回のテクニカル上位の info を、実行の冒頭（日足の大量取得の前）に取っておく。
+
+    数千銘柄の日足を取った直後は Yahoo がこの IP の crumb 取得を 429 で制限し、
+    info がすべて 401 になる。30〜90秒待っても解けないことを確認した
+    （2026-09-23 run #95: 3パスとも 0/40）。一方、実行冒頭の info は4回とも成功していた。
+    上位候補は日ごとの入れ替わりが小さいので、前回の上位をここで取れば大半をまかなえる。
+    """
+    data = _load_growth_info()
+    cache = data["info"]
+    targets = [c for c in data["shortlist"][:GROWTH_PREFETCH_N]]
+    got = _info_passes(targets, waits=(0,))
+    now = datetime.now(tz=JST).timestamp()
+    for c, d in got.items():
+        cache[c] = {**d, "ts": now}
+    print(f"growth prefetch: 前回上位{len(targets)}銘柄のうち{len(got)}銘柄の info を取得"
+          f"（保存済み有効 {len(cache)}銘柄）", file=sys.stderr)
+    return cache
+
+
+def _growth_confirm(codes: list[str], cache: dict[str, dict] | None = None) -> dict[str, dict]:
+    """上位候補の時価総額・証券種別・業績を確認する。先読み済み(cache)を優先し、足りない分だけ取りに行く。
+
+    取得できなかった銘柄は結果に含めない。新たに取れた分は cache にも書き足す。
+    """
+    cache = cache if cache is not None else {}
+    out = {c: cache[c] for c in codes if c in cache}
+    missing = [c for c in codes if c not in out]
+    got = _info_passes(missing)
+    now = datetime.now(tz=JST).timestamp()
+    for c, d in got.items():
+        out[c] = d
+        cache[c] = {**d, "ts": now}
+    print(f"growth confirm: {len(out)}/{len(codes)} 銘柄を確認（保存済み {len(codes) - len(missing)}"
+          f" ＋ 今回取得 {len(got)}）", file=sys.stderr)
     return out
 
 
@@ -1413,6 +1466,12 @@ def _analysis_from_frame(code: str, name: str, df: pd.DataFrame,
 
 
 def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict, list[Analysis]]:
+    # 大化け候補の info は、日足の大量取得で Yahoo に制限される前に先読みしておく
+    try:
+        growth_info = _prefetch_growth_info()
+    except Exception as e:
+        print(f"[globe] growth prefetch 失敗: {e}", file=sys.stderr)
+        growth_info = {}
     holdings = load_holdings()
     hold_codes = [h["code"] for h in holdings]
     uni = fetch_universe()
@@ -1518,7 +1577,8 @@ def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict, l
         rank_growth(feats)                                   # 母集団内の相対順位で採点
         order = sorted(feats, key=lambda c: (-feats[c]["tech"], c))
         shortlist = order[:GROWTH_CONFIRM_N]
-        top = _select_growth(shortlist, feats, _growth_confirm(shortlist))[:GROWTH_TOP_N]
+        top = _select_growth(shortlist, feats, _growth_confirm(shortlist, growth_info))[:GROWTH_TOP_N]
+        _save_growth_info(order[:GROWTH_PREFETCH_N], growth_info)   # 次回の冒頭で先読みする対象
 
         # 採点した銘柄はすべて検索対象(analyses)に合流させる。1年日足は取得済みなので
         # 追加の通信は発生せず、テクニカル計算だけで検索できる銘柄が数倍になる。
