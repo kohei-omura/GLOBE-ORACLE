@@ -1178,6 +1178,33 @@ def _growth_pool() -> list[dict]:
     return pool
 
 
+def _reset_yf_session() -> bool:
+    """yfinance のセッション・cookie・crumb を作り直す。
+
+    yfinance はプロセス全体で1つのセッションと crumb を使い回し、cookie はディスクにも
+    保存する。数千銘柄の日足取得のあとで Yahoo 側の cookie が失効すると、401 のたびに
+    同じ失効 cookie をディスクから読み直すため、以降の Ticker.info がすべて
+    Invalid Crumb で失敗する（2026-09-23 run #93: 逐次でも 0/40。同じ run の序盤、
+    日足の大量取得前の info は成功していた）。保存済み cookie を消して新しい
+    セッションから取り直させる。yfinance 内部に触れるため、失敗しても例外は外に出さない。
+    """
+    try:
+        from yfinance import cache as _yc
+        from yfinance.data import YfData
+        from yfinance._http import new_session
+        _yc.get_cookie_cache().store("curlCffi", None)       # ディスク上の失効 cookie を削除
+        yd = YfData()
+        yd._set_session(new_session())
+        with yd._cookie_lock:
+            yd._cookie = None
+            yd._crumb = None
+            yd._cookie_strategy = "basic"
+        return True
+    except Exception as e:
+        print(f"[globe] yfinanceセッション再作成に失敗: {e}", file=sys.stderr)
+        return False
+
+
 def _growth_confirm(codes: list[str]) -> dict[str, dict]:
     """上位候補だけ Ticker.info を取り、時価総額・証券種別・業績の伸びを確認する。
 
@@ -1193,6 +1220,7 @@ def _growth_confirm(codes: list[str]) -> dict[str, dict]:
         return {}
     import time as _t
     import yfinance as yf
+    _reset_yf_session()               # 大量ダウンロード後の失効 crumb を引きずらない
     out: dict[str, dict] = {}
     for c in codes:
         for attempt in range(2):
