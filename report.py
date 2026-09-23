@@ -1205,41 +1205,64 @@ def _reset_yf_session() -> bool:
         return False
 
 
+GROWTH_CONFIRM_WAITS = (0, 30, 60)     # 各パス前の待機秒（Yahooのレート制限が解けるのを待つ）
+GROWTH_CONFIRM_ABORT = 5               # 連続でこの件数失敗したらそのパスを打ち切る（叩き続けると制限が延びる）
+
+
+def _info_one(yf, code: str) -> dict | None:
+    """1銘柄の info を取り、実データ（quoteType か marketCap）がある時だけ返す。"""
+    try:
+        info = yf.Ticker(code).info or {}
+    except Exception:
+        return None
+    if not (info.get("quoteType") or info.get("marketCap")):
+        return None                   # 401時の yfinance は例外にせず中身の乏しい dict を返す
+    return {"mcap": info.get("marketCap"),
+            "qtype": str(info.get("quoteType") or "").upper(),
+            "sector": info.get("sector") or "",
+            "rev_g": info.get("revenueGrowth"),
+            "eps_g": info.get("earningsQuarterlyGrowth"),
+            "name": info.get("shortName") or info.get("longName") or ""}
+
+
 def _growth_confirm(codes: list[str]) -> dict[str, dict]:
     """上位候補だけ Ticker.info を取り、時価総額・証券種別・業績の伸びを確認する。
 
-    日足だけでは時価総額が分からず、GROWTH_MCAP_MIN（超小型株の除外）が効いていなかった。
-    全銘柄に info を叩くのは重すぎるため、テクニカル上位 GROWTH_CONFIRM_N 件に限る。
-
-    逐次で取得する。4並列にしたところ Yahoo の crumb が衝突して 401（Invalid Crumb）が
-    多発し、yfinance は例外を出さずに中身の乏しい dict を返したため、40/40 成功と数えた
-    まま時価総額も業績も空になっていた（2026-09-23 run #92）。実データの目印
-    （quoteType か marketCap）が無い応答は失敗として1回だけ再試行し、ダメなら結果に含めない。
+    数千銘柄の日足を取った直後は Yahoo がこの IP を一時的に制限し、crumb 取得が
+    429、以降の info が 401 になる（2026-09-23 run #94: セッション再作成直後に 429、
+    約45秒後から成功し 15/40）。そこで:
+      - 各パスの前にセッションを作り直し、2パス目以降は待機してから未取得分だけ再試行
+      - 連続 GROWTH_CONFIRM_ABORT 件失敗したらそのパスを打ち切る（叩き続けない）
+    取得できなかった銘柄は結果に含めない。
     """
     if not codes:
         return {}
     import time as _t
     import yfinance as yf
-    _reset_yf_session()               # 大量ダウンロード後の失効 crumb を引きずらない
     out: dict[str, dict] = {}
-    for c in codes:
-        for attempt in range(2):
-            try:
-                info = yf.Ticker(c).info or {}
-            except Exception as e:
-                if attempt == 1:
-                    print(f"[globe] 大化け候補info失敗 {c}: {e}", file=sys.stderr)
-                info = {}
-            if info.get("quoteType") or info.get("marketCap"):
-                out[c] = {"mcap": info.get("marketCap"),
-                          "qtype": str(info.get("quoteType") or "").upper(),
-                          "sector": info.get("sector") or "",
-                          "rev_g": info.get("revenueGrowth"),
-                          "eps_g": info.get("earningsQuarterlyGrowth"),
-                          "name": info.get("shortName") or info.get("longName") or ""}
+    pending = list(codes)
+    for n, wait in enumerate(GROWTH_CONFIRM_WAITS, 1):
+        if not pending:
+            break
+        if wait:
+            print(f"growth confirm: 未取得{len(pending)}銘柄 → {wait}秒待って再試行（{n}回目）",
+                  file=sys.stderr)
+            _t.sleep(wait)
+        _reset_yf_session()
+        failed: list[str] = []
+        streak = 0
+        for i, c in enumerate(pending):
+            d = _info_one(yf, c)
+            if d:
+                out[c] = d
+                streak = 0
+                continue
+            failed.append(c)
+            streak += 1
+            if streak >= GROWTH_CONFIRM_ABORT:     # 制限中。残りは次のパスへ回す
+                failed.extend(pending[i + 1:])
                 break
-            if attempt == 0:
-                _t.sleep(1.0)
+        pending = failed
     print(f"growth confirm: {len(out)}/{len(codes)} 銘柄の info を取得（実データあり）", file=sys.stderr)
     return out
 
@@ -1247,40 +1270,42 @@ def _growth_confirm(codes: list[str]) -> dict[str, dict]:
 def _select_growth(cands: list[str], feats: dict[str, dict], conf: dict[str, dict]) -> list[str]:
     """確認結果で除外・加点して最終順位を返す（cands はテクニカル順）。
 
-    除外: 普通株以外（quoteType≠EQUITY）、時価総額 GROWTH_MCAP_MIN 未満、info未取得。
-    加点: 売上成長率(60%)・四半期EPS成長率(40%)の候補内パーセンタイル → 最終 = 技術75% + 業績25%。
-    info がほぼ取れない（半分未満）ときはネットワーク障害とみなし、除外せずテクニカル順で返す。
+    除外: info で「普通株以外」または「時価総額 GROWTH_MCAP_MIN 未満」と確認できた銘柄。
+    info が取れなかった銘柄は判定できないので除外せず、verified=False を付けて残す
+    （カードに「未確認」と出す）。以前は取得が過半数に届かないと取れた分まで捨てていた。
+    業績点: 売上成長率(60%)・四半期EPS成長率(40%)の候補内パーセンタイル（未取得は中立）。
+    最終 = 技術75% + 業績25%。
     """
-    if len(conf) < max(1, len(cands) // 2):
-        GROWTH_UNIVERSE_SRC["confirmed"] = False
-        return list(cands)
-    GROWTH_UNIVERSE_SRC["confirmed"] = True
+    GROWTH_UNIVERSE_SRC["confirm_total"] = len(cands)
+    GROWTH_UNIVERSE_SRC["confirm_n"] = sum(1 for c in cands if c in conf)
     keep = []
     for c in cands:
         d = conf.get(c)
-        if d is None:
-            continue
-        if d["qtype"] and d["qtype"] != "EQUITY":
-            continue
-        if d["mcap"] is not None and d["mcap"] < GROWTH_MCAP_MIN:
-            continue
+        if d is not None:
+            if d["qtype"] and d["qtype"] != "EQUITY":
+                continue
+            if d["mcap"] is not None and d["mcap"] < GROWTH_MCAP_MIN:
+                continue
         keep.append(c)
     if not keep:
         return []
 
     def pct(key: str, lo: float, hi: float) -> pd.Series:
-        v = pd.Series({c: conf[c].get(key) for c in keep}, dtype="float64").clip(lo, hi)
+        v = pd.Series({c: (conf[c].get(key) if c in conf else None) for c in keep},
+                      dtype="float64").clip(lo, hi)
         return v.rank(pct=True).fillna(0.5)
 
     fund = (0.6 * pct("rev_g", -1.0, 5.0) + 0.4 * pct("eps_g", -1.0, 10.0)) * 100.0
     for c in keep:
-        f, d = feats[c], conf[c]
+        f, d = feats[c], conf.get(c)
         f["fund"] = round(float(fund[c]), 1)
         f["score"] = round(0.75 * f["tech"] + 0.25 * f["fund"], 1)
-        f["mcap"] = d["mcap"] or 0
-        f["sector"] = d["sector"]
-        f["rev_g"] = None if d["rev_g"] is None else round(d["rev_g"] * 100.0, 0)
-        f["name"] = d["name"]
+        f["verified"] = d is not None
+        if d is not None:
+            f["mcap"] = d["mcap"] or 0
+            f["sector"] = d["sector"]
+            f["rev_g"] = None if d["rev_g"] is None else round(d["rev_g"] * 100.0, 0)
+            f["name"] = d["name"]
     return sorted(keep, key=lambda c: (-feats[c]["score"], c))
 
 
@@ -1691,6 +1716,8 @@ def _growth_card(rank: int, a: Analysis) -> str:
     chips.append(f'出来高 {gr["vsurge"]:.1f}倍' if gr.get("vsurge") else "出来高 —")
     chips.append(f'ATR {gr["atrp"]:.1f}%' if gr.get("atrp") else "ATR —")
     chips.append(f'52週高値比 {gr["nh"]:.0f}%' if gr.get("nh") else "52週高値比 —")
+    if gr.get("verified") is False:
+        chips.append("時価総額・業績 未確認")
     chips_html = '<div class="reasons">' + "".join(
         f'<span class="chip">{_esc(c)}</span>' for c in chips) + "</div>"
     warn = ""
@@ -1720,10 +1747,16 @@ def _growth_section(growth: list[Analysis] | None) -> str:
                if GROWTH_POOL_REDUCED.get("reduced") else "")
     src = GROWTH_UNIVERSE_SRC.get("src") or "—"
     n_uni, n_sc = GROWTH_UNIVERSE_SRC.get("n_universe", 0), GROWTH_UNIVERSE_SRC.get("n_scored", 0)
-    conf = (f'上位{GROWTH_CONFIRM_N}銘柄は時価総額${GROWTH_MCAP_MIN/1e6:.0f}M以上・普通株であることを確認し、'
-            f'売上・利益の伸びを25%加味しています。'
-            if GROWTH_UNIVERSE_SRC.get("confirmed") else
-            '<span style="color:var(--dn)">⚠ 銘柄情報を取得できず、時価総額・業績の確認を省略しています。</span>')
+    n_ok = GROWTH_UNIVERSE_SRC.get("confirm_n", 0)
+    n_all = GROWTH_UNIVERSE_SRC.get("confirm_total", 0)
+    if n_all and n_ok == n_all:
+        conf = (f'上位{n_all}銘柄はすべて時価総額${GROWTH_MCAP_MIN/1e6:.0f}M以上・普通株であることを確認し、'
+                f'売上・利益の伸びを25%加味しています。')
+    elif n_ok:
+        conf = (f'上位{n_all}銘柄のうち<b>{n_ok}銘柄</b>で時価総額・普通株・業績を確認しました'
+                f'（確認できた銘柄のみ超小型株等を除外。「未確認」の銘柄は判定できていません）。')
+    else:
+        conf = ('<span style="color:var(--dn)">⚠ 銘柄情報を取得できず、時価総額・業績の確認を省略しています。</span>')
     foot = (f'<p class="cfoot">{reduced}母集団：{_esc(src)} <b>{n_uni:,}銘柄</b> → '
             f'株価 ${GROWTH_PX_MIN:.0f}〜${GROWTH_PX_MAX:.0f}未満（2桁株）・'
             f'平均出来高 {GROWTH_VOL_MIN:,}株超で <b>{n_sc:,}銘柄</b>に絞り、'
