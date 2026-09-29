@@ -160,7 +160,23 @@
   }
 
   /* ---- ライブ価格 ---- */
+  /* 保有カードの損益と利確・損切の到達状況（サーバ側 _hold_pl_html と同じ表示） */
+  function holdPl(price, avg, tgt, stp) {
+    var pct = avg ? Math.round((price - avg) / avg * 1000) / 10 : 0, cls = pct >= 0 ? 'up' : 'dn', hit = '';
+    if (stp && price <= stp) hit = '<b class="hit dn">⚠ 損切ライン到達</b>';
+    else if (tgt && price >= tgt) hit = '<b class="hit up">✅ 利確ライン到達</b>';
+    var dist = (!hit && price > 0 && tgt && stp) ? '<span class="hnote">利確まで +' + ((tgt - price) / price * 100).toFixed(1) +
+      '% ／ 損切まで -' + ((price - stp) / price * 100).toFixed(1) + '%</span>' : '';
+    return '<span class="' + cls + '">損益 ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>' + hit +
+      '<span class="hnote">買値 ' + fmtMoney(avg) + ' → 現値 ' + fmtMoney(price) + '</span>' + dist;
+  }
   function applyPrices(map) {
+    /* 損益の行も現値に追従させる（以前は生成時の株価のままで、上の現値と食い違っていた） */
+    document.querySelectorAll('[data-hold-c]').forEach(function (el) {
+      var c = el.getAttribute('data-hold-c'); if (map[c] == null) return;
+      el.innerHTML = holdPl(Number(map[c]), parseFloat(el.getAttribute('data-avg')) || 0,
+        parseFloat(el.getAttribute('data-tgt')) || 0, parseFloat(el.getAttribute('data-stp')) || 0);
+    });
     document.querySelectorAll('[data-px]').forEach(function (el) {
       var c = el.getAttribute('data-px'); if (map[c] != null) { el.setAttribute('data-usd', map[c]); el.textContent = fmtMoney(map[c]); }
     });
