@@ -467,7 +467,7 @@ def _atr(high, low, close, n: int = 14) -> pd.Series:
 
 class Analysis:
     __slots__ = ("code", "name", "sector", "price", "sc", "g", "reasons",
-                 "tgt", "stp", "rr", "ez", "fund", "bt", "gr")
+                 "tgt", "stp", "rr", "ez", "fund", "bt", "gr", "atr")
 
     def __init__(self, code, name, sector, price):
         self.code = code
@@ -484,6 +484,7 @@ class Analysis:
         self.fund = None
         self.bt = None
         self.gr = None      # 大化け候補の特徴量と点数（growth_features＋rank_growth）
+        self.atr = None     # ATR14（保有銘柄の買値基準ラインに使う）
 
 
 def _clip(v, lo, hi):
@@ -574,7 +575,7 @@ def technical_score(df: pd.DataFrame) -> tuple[int, list[str], dict]:
     # 狙い目（押し目）指値: 直近安値圏 or -1ATR
     dip = round(price - 1.0 * a1, 2)
     gap = round((price - dip) / price * 100.0, 0)
-    levels = {"tgt": tgt, "stp": stp, "rr": rr,
+    levels = {"tgt": tgt, "stp": stp, "rr": rr, "atr": round(a1, 4),
               "ez": {"dip": dip, "hi": round(price, 2), "gap": gap}}
     return sc, reasons[:4], levels
 
@@ -1458,7 +1459,7 @@ def _analysis_from_frame(code: str, name: str, df: pd.DataFrame,
         a = Analysis(code, name or code, sector, round(float(close.iloc[-1]), 2))
         a.sc, a.g, a.reasons = sc, signal_of(sc), reasons
         if lv:
-            a.tgt, a.stp, a.rr, a.ez = lv["tgt"], lv["stp"], lv["rr"], lv["ez"]
+            a.tgt, a.stp, a.rr, a.ez, a.atr = lv["tgt"], lv["stp"], lv["rr"], lv["ez"], lv.get("atr")
         return a
     except Exception as e:
         print(f"[globe] 分析失敗 {code}: {e}", file=sys.stderr)
@@ -1506,7 +1507,7 @@ def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict, l
             a.g = signal_of(sc)
             a.reasons = reasons
             if lv:
-                a.tgt, a.stp, a.rr, a.ez = lv["tgt"], lv["stp"], lv["rr"], lv["ez"]
+                a.tgt, a.stp, a.rr, a.ez, a.atr = lv["tgt"], lv["stp"], lv["rr"], lv["ez"], lv.get("atr")
             analyses.append(a)
         except Exception as e:
             print(f"[globe] 分析失敗 {c}: {e}", file=sys.stderr)
@@ -1556,7 +1557,7 @@ def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict, l
                 a.g = signal_of(sc)
                 a.reasons = reasons
                 if lv:
-                    a.tgt, a.stp, a.rr, a.ez = lv["tgt"], lv["stp"], lv["rr"], lv["ez"]
+                    a.tgt, a.stp, a.rr, a.ez, a.atr = lv["tgt"], lv["stp"], lv["rr"], lv["ez"], lv.get("atr")
                 analyses.append(a)
             except Exception as e:
                 print(f"[globe] 候補分析失敗 {c}: {e}", file=sys.stderr)
@@ -1901,6 +1902,9 @@ border-radius:8px;padding:1px 6px;margin-left:6px}
 .fair.up b{color:var(--up)}.fair.dn b{color:var(--dn)}.fair.hold b{color:var(--gold)}
 .pl{margin-top:8px;font-size:13px;font-weight:800}
 .pl.up{color:var(--up)}.pl.dn{color:var(--dn)}
+.pl .up{color:var(--up)}.pl .dn{color:var(--dn)}
+.pl .hit{margin-left:8px;font-size:12px}
+.hbasis{display:block;margin:4px 0 0;font-weight:600}
 .hold-sum{margin:0 0 10px;padding:10px 13px;border:1px solid var(--line);border-radius:12px;background:var(--card);font-size:13px;color:var(--fg)}
 .hold-sum b.up{color:var(--up)}.hold-sum b.dn{color:var(--dn)}
 .hold-sum-note{color:var(--mut);font-size:10.5px;margin-left:6px}
@@ -2084,7 +2088,23 @@ APP_JS = r"""
   }
 
   /* ---- ライブ価格 ---- */
+  /* 保有カードの損益と利確・損切の到達状況（サーバ側 _hold_pl_html と同じ表示） */
+  function holdPl(price, avg, tgt, stp) {
+    var pct = avg ? Math.round((price - avg) / avg * 1000) / 10 : 0, cls = pct >= 0 ? 'up' : 'dn', hit = '';
+    if (stp && price <= stp) hit = '<b class="hit dn">⚠ 損切ライン到達</b>';
+    else if (tgt && price >= tgt) hit = '<b class="hit up">✅ 利確ライン到達</b>';
+    var dist = (!hit && price > 0 && tgt && stp) ? '<span class="hnote">利確まで +' + ((tgt - price) / price * 100).toFixed(1) +
+      '% ／ 損切まで -' + ((price - stp) / price * 100).toFixed(1) + '%</span>' : '';
+    return '<span class="' + cls + '">損益 ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>' + hit +
+      '<span class="hnote">買値 ' + fmtMoney(avg) + ' → 現値 ' + fmtMoney(price) + '</span>' + dist;
+  }
   function applyPrices(map) {
+    /* 損益の行も現値に追従させる（以前は生成時の株価のままで、上の現値と食い違っていた） */
+    document.querySelectorAll('[data-hold-c]').forEach(function (el) {
+      var c = el.getAttribute('data-hold-c'); if (map[c] == null) return;
+      el.innerHTML = holdPl(Number(map[c]), parseFloat(el.getAttribute('data-avg')) || 0,
+        parseFloat(el.getAttribute('data-tgt')) || 0, parseFloat(el.getAttribute('data-stp')) || 0);
+    });
     document.querySelectorAll('[data-px]').forEach(function (el) {
       var c = el.getAttribute('data-px'); if (map[c] != null) { el.setAttribute('data-usd', map[c]); el.textContent = fmtMoney(map[c]); }
     });
@@ -2249,7 +2269,55 @@ def _to_stock_json(a: Analysis, rank: int) -> dict:
     }
 
 
-def _holding_card(h: dict, amap: dict, valid=None) -> str:
+HOLDING_LEVELS_FILE = DOCS / "holding_levels.json"
+HOLD_TGT_ATR = 2.0     # 利確 = 買値 + 2×ATR
+HOLD_STP_ATR = 1.5     # 損切 = 買値 − 1.5×ATR
+
+
+def _anchored_levels(avg: float, a: Analysis) -> dict | None:
+    """買値を基準に利確・損切を決める（ATRは設定した日の値）。"""
+    atr = a.atr or ((a.tgt - a.price) / 2.0 if a.tgt and a.price else None)
+    if not (avg and atr and atr > 0):
+        return None
+    return {"avg": round(float(avg), 4), "atr": round(float(atr), 4),
+            "tgt": round(avg + HOLD_TGT_ATR * atr, 2), "stp": round(avg - HOLD_STP_ATR * atr, 2),
+            "set": datetime.now(tz=JST).strftime("%Y-%m-%d")}
+
+
+def holding_levels(holdings: list[dict], amap: dict) -> dict[str, dict]:
+    """保有銘柄の利確・損切を買値基準で決め、初回に保存して以後は固定する。
+
+    以前は全銘柄共通の「現値±ATR」を保有にも使っていたため、株価が下がると損切ラインも
+    一緒に下がり、損切が機能しなかった（例: DVN 買値$49.19 に対し現値$47.05基準の
+    損切$44.85）。ここでは買値＋2ATR／買値−1.5ATRを初めて表示した日に固定し、
+    買値が変わった（買い増し等で holdings.txt を書き換えた）ときだけ再計算する。
+    holdings.txt で手動指定した利確・損切はそちらを優先する（_holding_card）。
+    """
+    try:
+        saved = json.loads(HOLDING_LEVELS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(saved, dict):
+            saved = {}
+    except Exception:
+        saved = {}
+    out: dict[str, dict] = {}
+    for h in holdings:
+        code, avg = h.get("code"), h.get("avg") or 0
+        prev = saved.get(code)
+        if isinstance(prev, dict) and abs(float(prev.get("avg", -1)) - float(avg)) < 1e-6:
+            out[code] = prev                         # 買値が同じなら固定値を使い続ける
+            continue
+        a = amap.get(code)
+        lv = _anchored_levels(avg, a) if a else None
+        if lv:
+            out[code] = lv
+    try:
+        HOLDING_LEVELS_FILE.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as e:
+        print(f"[globe] {HOLDING_LEVELS_FILE.name} 保存失敗: {e}", file=sys.stderr)
+    return out
+
+
+def _holding_card(h: dict, amap: dict, valid=None, levels: dict | None = None) -> str:
     code = h.get("code")
     a = amap.get(code)
     avg = h.get("avg", 0) or 0
@@ -2266,30 +2334,47 @@ def _holding_card(h: dict, amap: dict, valid=None) -> str:
                 f'<span class="name">買値 {_usd(avg)}</span></div>'
                 f'<span class="badge hold">?</span></div>'
                 f'<div class="pl dn">{hint}</div></div>')
-    if h.get("tgt") or h.get("stp"):
-        # holdings.txt の手動指定はこのカード限定。共有のAnalysisを書き換えると
-        # stocks.json や他セクションの自動算出水準まで上書きされてしまう。
-        a = copy.copy(a)
-        if h.get("tgt"):
-            a.tgt = h["tgt"]
-        if h.get("stp"):
-            a.stp = h["stp"]
-        # 水準が変わったのでRRも手動値ベースで再計算（自動算出のRRが残ると矛盾する）
-        a.rr = (round((a.tgt - a.price) / (a.price - a.stp), 1)
-                if (a.tgt and a.stp and a.price > a.stp) else None)
-    pl_pct = round((a.price - avg) / avg * 100.0, 1) if avg else 0.0
-    cls = "up" if pl_pct >= 0 else "dn"
-    pl = (f'<div class="pl {cls}">損益 {"+" if pl_pct>=0 else ""}{pl_pct}%'
-          f'<span class="hnote">買値 {_usd(avg)} → 現値 {_usd(a.price)}</span></div>')
+    # 利確・損切は買値基準（保存済みの固定値）。手動指定があればそれを優先。
+    # 共有の Analysis を書き換えると stocks.json や他セクションまで変わるのでコピーに適用する。
+    lv = (levels or {}).get(code) or _anchored_levels(avg, a) or {}
+    a = copy.copy(a)
+    a.tgt = h.get("tgt") or lv.get("tgt") or a.tgt
+    a.stp = h.get("stp") or lv.get("stp") or a.stp
+    # 保有では RR（現値からの残り利幅÷残り損失幅）は損切に近づくと数十倍に跳ねて意味を失うので出さず、
+    # 代わりに各ラインまでの距離を損益の行に出す。
+    a.rr = None
+    basis = "手動指定" if (h.get("tgt") or h.get("stp")) else (
+        f'買値基準・{lv["set"]}設定' if lv.get("set") else "買値基準")
+    pl = (f'<div class="pl" data-hold-c="{_esc(code)}" data-avg="{avg}" '
+          f'data-tgt="{a.tgt or ""}" data-stp="{a.stp or ""}">{_hold_pl_html(a.price, avg, a.tgt, a.stp)}</div>'
+          f'<div class="hnote hbasis">利確・損切は{basis}（株価が動いても変わりません）</div>')
     base = _card(0, a, True).replace('<span class="rank">0</span>', '<span class="rank">保有</span>')
     return base[:-6] + pl + "</div>"
+
+
+def _hold_pl_html(price: float, avg: float, tgt, stp) -> str:
+    """損益と利確・損切ラインの到達状況（JS の holdPl と同じ表示）。"""
+    pl_pct = round((price - avg) / avg * 100.0, 1) if avg else 0.0
+    cls = "up" if pl_pct >= 0 else "dn"
+    hit = ""
+    if stp and price <= stp:
+        hit = '<b class="hit dn">⚠ 損切ライン到達</b>'
+    elif tgt and price >= tgt:
+        hit = '<b class="hit up">✅ 利確ライン到達</b>'
+    dist = ""
+    if not hit and price > 0 and tgt and stp:
+        dist = (f'<span class="hnote">利確まで +{(tgt - price) / price * 100:.1f}% ／ '
+                f'損切まで -{(price - stp) / price * 100:.1f}%</span>')
+    return (f'<span class="{cls}">損益 {"+" if pl_pct >= 0 else ""}{pl_pct}%</span>{hit}'
+            f'<span class="hnote">買値 {_usd(avg)} → 現値 {_usd(price)}</span>{dist}')
 
 
 def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
                     holdings: list[dict] | None = None,
                     cands: list[dict] | None = None,
                     cmeta: dict | None = None,
-                    growth: list[Analysis] | None = None) -> tuple[str, dict]:
+                    growth: list[Analysis] | None = None,
+                    hlevels: dict | None = None) -> tuple[str, dict]:
     holdings = holdings or []
     cands = cands or []
     cmeta = cmeta or {}
@@ -2322,7 +2407,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
                     f'<b class="{"up" if _tot>=0 else "dn"}">{"+" if _tot>=0 else ""}{_usd(_tot)}</b>'
                     f'（¥換算 {_yen}）／ 含み益{_win}銘柄・含み損{_los}銘柄'
                     f'<span class="hold-sum-note">（1株あたり合算）</span></div>')
-    hold_cards = hold_sum + "".join(_holding_card(h, amap, _valid_tk) for h in holdings)
+    hold_cards = hold_sum + "".join(_holding_card(h, amap, _valid_tk, hlevels) for h in holdings)
     hold_sec = _section("💼 保有銘柄", "MY HOLDINGS", hold_cards) if holdings else ""
     cand_sec = _candidate_section(cands, cmeta, amap)
     growth_sec = _growth_section(growth)
@@ -2420,7 +2505,8 @@ def write_dashboard() -> Path:
             f"分析できた銘柄が {len(analyses)} 件しかありません"
             f"（下限 {DASHBOARD_MIN_STOCKS} 件）。docs/ は一切変更していません")
     usdjpy = _fetch_usdjpy()
-    html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta, growth)
+    hlevels = holding_levels(holdings, {a.code: a for a in analyses})   # 買値基準の利確・損切（初回に固定）
+    html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta, growth, hlevels)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
     (DOCS / "app.js").write_text(APP_JS, encoding="utf-8")
     # 区切りの空白を詰め、検索キーはクライアント生成にして転送量を削減（1,800銘柄超で約500KB）
