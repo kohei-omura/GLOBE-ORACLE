@@ -14,6 +14,7 @@ import copy
 import csv
 import json
 import math
+import os
 import re
 import sys
 import traceback
@@ -1831,6 +1832,172 @@ def _growth_section(growth: list[Analysis] | None) -> str:
             f'<em>RS×高値圏×買い集め×業績</em></h2><div class="cards">{cards}</div>{foot}</section>')
 
 
+# ─────────────────────────────────────────────
+#  M&Aシグナル（SEC EDGAR の公開開示）
+#   買収の「発表前」を確実に知る方法は無い（未公表の買収情報で売買すればインサイダー取引）。
+#   ここで拾うのは公開開示のうち、買収の前兆になりやすいもの（13D・戦略的選択肢の検討）と、
+#   買収合意・公開買付けそのものの開示。13D が出ても大半は買収に至らない点に注意。
+# ─────────────────────────────────────────────
+MA_FILE = DOCS / "ma_signals.json"       # 取得した開示の履歴（前兆→発表の検証に使う）
+MA_LOOKBACK_DAYS = 30                    # 表示・取得する期間
+MA_HISTORY_DAYS = 180                    # 履歴として残す期間
+MA_ROWS_PER_GROUP = 12
+# SEC はアクセス元の明示（User-Agent）を求める。連絡先を入れたい場合は
+# GitHub の Secrets に SEC_USER_AGENT（例: "名前 you@example.com"）を設定する。
+SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT") or \
+    "GLOBE-ORACLE dashboard (+https://github.com/kohei-omura/GLOBE-ORACLE)"
+MA_QUERIES = (   # (種別, 全文検索の語句, 書類の種類)
+    ("13d", '"Schedule 13D"', "SC 13D,SCHEDULE 13D"),
+    ("strategic", '"strategic alternatives"', "8-K"),
+    ("deal", '"Agreement and Plan of Merger"', "8-K"),
+    ("tender", '"Offer to Purchase"', "SC TO-T"),
+)
+MA_LABEL = {"13d": "13D 5%超取得", "strategic": "戦略的選択肢の検討",
+            "deal": "合併契約の開示", "tender": "公開買付け"}
+_MA_TICKERS_RE = re.compile(r"\(([A-Z0-9.\-]{1,6}(?:,\s*[A-Z0-9.\-]{1,6})*)\)\s*\(CIK", re.I)
+
+
+def _sec_search(q: str, forms: str, start: str, end: str, pages: int = 2) -> list[dict]:
+    """EDGAR 全文検索（efts.sec.gov）の hits を返す。失敗時は例外。"""
+    if requests is None:
+        raise RuntimeError("requests が無い")
+    import time as _t
+    out: list[dict] = []
+    for page in range(pages):
+        r = requests.get("https://efts.sec.gov/LATEST/search-index",
+                         params={"q": q, "forms": forms, "dateRange": "custom",
+                                 "startdt": start, "enddt": end, "from": page * 100},
+                         headers={"User-Agent": SEC_USER_AGENT, "Accept": "application/json"},
+                         timeout=30)
+        r.raise_for_status()
+        hits = ((r.json() or {}).get("hits") or {}).get("hits") or []
+        out.extend(hits)
+        if len(hits) < 100:
+            break
+        _t.sleep(0.3)                    # SEC のアクセス上限（毎秒10件）に十分余裕を持たせる
+    return out
+
+
+def _parse_ma_hits(kind: str, hits: list[dict]) -> list[dict]:
+    """検索結果を (開示, ティッカー) 単位のレコードにする。ティッカーの無い当事者（ファンド等）は除く。"""
+    out: list[dict] = []
+    for h in hits:
+        src = h.get("_source") or {}
+        adsh, _, fname = str(h.get("_id") or "").partition(":")
+        adsh = adsh or src.get("adsh") or ""
+        names = src.get("display_names") or []
+        ciks = src.get("ciks") or []
+        for i, dn in enumerate(names):
+            m = _MA_TICKERS_RE.search(dn or "")
+            if not m:
+                continue
+            company = (dn.split("(")[0] or "").strip()
+            cik = str(ciks[i] if i < len(ciks) else (ciks[0] if ciks else "")).lstrip("0")
+            url = (f"https://www.sec.gov/Archives/edgar/data/{cik}/{adsh.replace('-', '')}/{fname}"
+                   if cik and adsh and fname else
+                   f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}")
+            for tk in m.group(1).split(","):
+                tk = _norm_ticker(tk)
+                if tk:
+                    out.append({"id": f"{adsh}|{tk}|{kind}", "kind": kind, "ticker": tk,
+                                "name": company, "form": src.get("form") or src.get("file_type") or "",
+                                "date": str(src.get("file_date") or "")[:10], "url": url})
+    return out
+
+
+def fetch_ma_signals() -> dict:
+    """直近 MA_LOOKBACK_DAYS 日の M&A 関連開示を取得し、履歴に統合して保存する。
+
+    返り値: {"ok": 取得できた種別数, "total": 種別数, "records": [...（履歴全体）]}
+    取得に失敗した種別があっても、保存済みの履歴はそのまま使う。
+    """
+    try:
+        hist = json.loads(MA_FILE.read_text(encoding="utf-8"))
+        recs = {r["id"]: r for r in hist.get("records", []) if isinstance(r, dict) and r.get("id")}
+    except Exception:
+        recs = {}
+    today = datetime.now(tz=ET).date()
+    start = (today - timedelta(days=MA_LOOKBACK_DAYS)).isoformat()
+    ok = 0
+    import time as _t
+    for kind, q, forms in MA_QUERIES:
+        try:
+            rows = _parse_ma_hits(kind, _sec_search(q, forms, start, today.isoformat()))
+            for r in rows:
+                recs.setdefault(r["id"], r)
+            ok += 1
+            print(f"M&A {kind}: {len(rows)}件", file=sys.stderr)
+        except Exception as e:
+            print(f"[globe] M&A {kind} 取得失敗: {e}", file=sys.stderr)
+        _t.sleep(0.3)
+    cutoff = (today - timedelta(days=MA_HISTORY_DAYS)).isoformat()
+    records = sorted((r for r in recs.values() if r.get("date", "") >= cutoff),
+                     key=lambda r: (r.get("date", ""), r["ticker"]), reverse=True)
+    try:
+        MA_FILE.write_text(json.dumps({"asof": datetime.now(tz=JST).strftime("%Y-%m-%d %H:%M"),
+                                       "records": records}, ensure_ascii=False, separators=(",", ":")),
+                           encoding="utf-8")
+    except Exception as e:
+        print(f"[globe] {MA_FILE.name} 保存失敗: {e}", file=sys.stderr)
+    return {"ok": ok, "total": len(MA_QUERIES), "records": records}
+
+
+def _ma_section(ma: dict | None, amap: dict, focus: dict[str, str]) -> str:
+    """M&A シグナル欄。focus は {ティッカー: 理由（保有中/大化け候補/買い候補）}。"""
+    if not ma:
+        return ""
+    recs = ma.get("records") or []
+    cutoff = (datetime.now(tz=ET).date() - timedelta(days=MA_LOOKBACK_DAYS)).isoformat()
+    recent = [r for r in recs if r.get("date", "") >= cutoff]
+    # 前兆（13D・戦略的選択肢）が先に出ていた銘柄 → 合併契約・公開買付けの行に「前兆」を付ける
+    first_pre: dict[str, str] = {}
+    for r in recs:
+        if r["kind"] in ("13d", "strategic"):
+            d = first_pre.get(r["ticker"])
+            first_pre[r["ticker"]] = min(d, r["date"]) if d else r["date"]
+
+    def row(r: dict) -> str:
+        tk = r["ticker"]; a = amap.get(tk)
+        tags = f'<span class="chip ma-{r["kind"]}">{_esc(MA_LABEL.get(r["kind"], r["kind"]))}</span>'
+        if tk in focus:
+            tags += f'<span class="chip ma-focus">{_esc(focus[tk])}</span>'
+        if r["kind"] in ("deal", "tender") and first_pre.get(tk, "9") < r["date"]:
+            tags += f'<span class="chip ma-pre">前兆 {first_pre[tk][5:].replace("-", "/")}〜</span>'
+        px = f'<span class="ma-px">{_usd(a.price)}</span>' if a else ""
+        return (f'<div class="ma-row" data-ma-c="{_esc(tk)}"><span class="ma-date">'
+                f'{_esc(r["date"][5:].replace("-", "/"))}</span><span class="code">{_esc(tk)}</span>'
+                f'<span class="name">{_esc(r["name"][:40])}</span>{px}{tags}'
+                f'<a class="ma-link" href="{_esc(r["url"])}" target="_blank" rel="noopener">開示</a></div>')
+
+    def pick(rows: list[dict]) -> list[dict]:
+        """同じ銘柄・種別は最新1件。分析対象の銘柄を先に、各群は新しい順で最大 MA_ROWS_PER_GROUP 件。"""
+        seen, uniq = set(), []
+        for r in sorted(rows, key=lambda r: r["date"], reverse=True):
+            if (r["ticker"], r["kind"]) not in seen:
+                seen.add((r["ticker"], r["kind"])); uniq.append(r)
+        return sorted(uniq, key=lambda r: r["ticker"] not in amap)[:MA_ROWS_PER_GROUP]
+
+    groups = [("あなたの保有・注目銘柄", [r for r in recent if r["ticker"] in focus]),
+              ("13D（5%超取得・経営関与の表明）", [r for r in recent if r["kind"] == "13d"]),
+              ("戦略的選択肢の検討（売却を含む）", [r for r in recent if r["kind"] == "strategic"]),
+              ("買収合意・公開買付け（発表済み）", [r for r in recent if r["kind"] in ("deal", "tender")])]
+    body = "".join(f'<h3 class="ma-h">{_esc(t)}</h3>' + "".join(row(r) for r in pick(rows))
+                   for t, rows in groups if rows)
+    if not body:
+        body = f'<p class="empty">直近{MA_LOOKBACK_DAYS}日に該当する開示はありません。</p>'
+    warn = ""
+    if ma.get("ok", 0) < ma.get("total", 0):
+        warn = (f'<span style="color:var(--dn)">⚠ SEC への問い合わせの一部が失敗しました'
+                f'（{ma.get("ok", 0)}/{ma.get("total", 0)}種別のみ最新）。</span> ')
+    foot = (f'<p class="cfoot">{warn}SEC EDGAR の公開開示から直近{MA_LOOKBACK_DAYS}日分を毎日取得しています。'
+            f'13D は投資家が5%超を取得し経営への関与を表明したもの、「戦略的選択肢の検討」は会社が売却を含む'
+            f'選択肢を検討していると開示したもので、どちらも買収の前兆になりやすい一方、<b>大半は買収に至りません。</b>'
+            f'合併契約の開示は買収側・被買収側の両方を含みます。発表後は株価が買収価格近くまで一気に動くため、'
+            f'発表後の売買で得られる利益は通常わずかです。未公表の買収情報は扱いません。</p>')
+    return (f'<section class="sec"><h2 class="find"><span>🕵️ M&amp;Aシグナル（SEC開示）</span>'
+            f'<em>13D・戦略的選択肢・買収合意</em></h2><div class="ma">{body}</div>{foot}</section>')
+
+
 CSS_STR = r"""
 :root{--bg:#0a0f1e;--bg2:#0f1730;--card:#111c38;--line:rgba(255,255,255,.08);
 --fg:#eaf0ff;--mut:#8ea3c8;--gold:#e8c96a;--gold2:#caa64c;
@@ -1905,6 +2072,14 @@ border-radius:8px;padding:1px 6px;margin-left:6px}
 .pl .up{color:var(--up)}.pl .dn{color:var(--dn)}
 .pl .hit{margin-left:8px;font-size:12px}
 .hbasis{display:block;margin:4px 0 0;font-weight:600}
+.ma{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:6px 12px}
+.ma-h{font-size:12px;color:var(--gold2);letter-spacing:.06em;margin:10px 0 4px}
+.ma-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:7px 0;border-top:1px solid var(--line);font-size:12px}
+.ma-row .name{margin-left:0;flex:1;min-width:120px}.ma-date{color:var(--mut);min-width:38px}
+.ma-px{font-weight:700}.ma-link{color:var(--gold);font-size:11px;text-decoration:none}
+.chip.ma-focus,.chip.ma-watch{color:var(--up);border-color:rgba(70,196,106,.45)}
+.chip.ma-pre{color:var(--dn);border-color:rgba(240,97,109,.45)}
+.ma-row.watched{background:rgba(70,196,106,.06)}
 .hold-sum{margin:0 0 10px;padding:10px 13px;border:1px solid var(--line);border-radius:12px;background:var(--card);font-size:13px;color:var(--fg)}
 .hold-sum b.up{color:var(--up)}.hold-sum b.dn{color:var(--dn)}
 .hold-sum-note{color:var(--mut);font-size:10.5px;margin-left:6px}
@@ -2067,11 +2242,20 @@ APP_JS = r"""
       var b = document.createElement('button'); b.className = 'star' + (inWatch(c) ? ' on' : ''); b.setAttribute('data-star', c); b.textContent = inWatch(c) ? '★' : '☆'; r1.appendChild(b);
     }
   }
+  /* M&Aシグナル欄でウォッチ中の銘柄を強調（ウォッチはこの端末のブラウザにだけ保存されている） */
+  function markMaWatch() {
+    document.querySelectorAll('[data-ma-c]').forEach(function (el) {
+      var on = inWatch(el.getAttribute('data-ma-c')), tag = el.querySelector('.ma-watch');
+      el.classList.toggle('watched', on);
+      if (on && !tag) { var t = document.createElement('span'); t.className = 'chip ma-watch'; t.textContent = '★ウォッチ中'; el.insertBefore(t, el.querySelector('.ma-link')); }
+      if (!on && tag) tag.remove();
+    });
+  }
   function syncStars() { var btns = document.querySelectorAll('[data-star]'); for (var i = 0; i < btns.length; i++) { var c = btns[i].getAttribute('data-star'), on = inWatch(c); btns[i].className = 'star' + (on ? ' on' : ''); btns[i].textContent = on ? '★' : '☆'; } }
   document.addEventListener('click', function (ev) {
     var t = ev.target; if (!t || !t.getAttribute) return;
-    var sc = t.getAttribute('data-star'); if (sc) { toggleWatch(sc); syncStars(); renderWatch(); return; }
-    var rm = t.getAttribute('data-rm'); if (rm) { toggleWatch(rm); syncStars(); renderWatch(); return; }
+    var sc = t.getAttribute('data-star'); if (sc) { toggleWatch(sc); syncStars(); renderWatch(); markMaWatch(); return; }
+    var rm = t.getAttribute('data-rm'); if (rm) { toggleWatch(rm); syncStars(); renderWatch(); markMaWatch(); return; }
   });
 
   /* ---- USD⇄JPY トグル ---- */
@@ -2175,7 +2359,7 @@ APP_JS = r"""
   }
 
   function init() {
-    addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus();
+    addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
     tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }
@@ -2374,7 +2558,8 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
                     cands: list[dict] | None = None,
                     cmeta: dict | None = None,
                     growth: list[Analysis] | None = None,
-                    hlevels: dict | None = None) -> tuple[str, dict]:
+                    hlevels: dict | None = None,
+                    ma: dict | None = None) -> tuple[str, dict]:
     holdings = holdings or []
     cands = cands or []
     cmeta = cmeta or {}
@@ -2411,6 +2596,10 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
     hold_sec = _section("💼 保有銘柄", "MY HOLDINGS", hold_cards) if holdings else ""
     cand_sec = _candidate_section(cands, cmeta, amap)
     growth_sec = _growth_section(growth)
+    focus = {a.code: "大化け候補" for a in growth}
+    focus.update({a.code: "買い候補" for a in buy_rank})
+    focus.update({h["code"]: "保有中" for h in holdings if h.get("code")})
+    ma_sec = _ma_section(ma, amap, focus)
 
     # ライブ価格(prices.json)の対象＝実際にカード表示している銘柄。
     #   保有 → 買い候補 → 大化け候補 → 候補レーダー の順（write_pricesが先頭40件に切るため優先度順）。
@@ -2468,6 +2657,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
 
   {_section("買い候補ランキング TOP10", "条件：アナリスト予想プラス × 割安判定", buy_cards)}
   {growth_sec}
+  {ma_sec}
   {hold_sec}
 
   <footer>
@@ -2506,7 +2696,12 @@ def write_dashboard() -> Path:
             f"（下限 {DASHBOARD_MIN_STOCKS} 件）。docs/ は一切変更していません")
     usdjpy = _fetch_usdjpy()
     hlevels = holding_levels(holdings, {a.code: a for a in analyses})   # 買値基準の利確・損切（初回に固定）
-    html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta, growth, hlevels)
+    try:
+        ma = fetch_ma_signals()                                             # SEC の M&A 関連開示
+    except Exception as e:
+        print(f"[globe] M&Aシグナル失敗: {e}", file=sys.stderr)
+        ma = None
+    html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta, growth, hlevels, ma)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
     (DOCS / "app.js").write_text(APP_JS, encoding="utf-8")
     # 区切りの空白を詰め、検索キーはクライアント生成にして転送量を削減（1,800銘柄超で約500KB）
