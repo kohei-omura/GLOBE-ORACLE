@@ -1853,12 +1853,17 @@ SEC_USER_AGENT = os.environ.get("SEC_USER_AGENT") or \
     "GLOBE-ORACLE dashboard (+https://github.com/kohei-omura/GLOBE-ORACLE)"
 MA_QUERIES = (   # (種別, 全文検索の語句, 書類の種類)
     ("13d", '"Schedule 13D"', "SC 13D,SCHEDULE 13D"),
-    ("strategic", '"strategic alternatives"', "8-K"),
-    ("deal", '"Agreement and Plan of Merger"', "8-K"),
+    ("strategic", '"strategic alternatives"', "8-K,6-K"),
+    ("deal", '"Agreement and Plan of Merger"', "8-K,6-K"),
+    # 英国企業の買収は合併契約ではなくスキーム・オブ・アレンジメント（例: SLN は
+    # "Agreement and Plan of Merger" に掛からず、契約書の前文で戦略的選択肢側に入っていた）
+    ("deal", '"scheme of arrangement"', "8-K,6-K"),
     ("tender", '"Offer to Purchase"', "SC TO-T"),
 )
 MA_LABEL = {"13d": "13D 5%超取得", "strategic": "戦略的選択肢の検討",
             "deal": "合併契約の開示", "tender": "公開買付け"}
+# 8-K の Exhibit 2.1 は買収・合併契約書そのもの（ファイル名 d…dex21.htm / ex2-1.htm 等）
+_MA_EX21_RE = re.compile(r"(?:^|[^0-9])ex-?0?2[._-]?0?1(?:[^0-9]|$)|dex21", re.I)
 _MA_TICKERS_RE = re.compile(r"\(([A-Z0-9.\-]{1,6}(?:,\s*[A-Z0-9.\-]{1,6})*)\)\s*\(CIK", re.I)
 
 
@@ -1898,17 +1903,32 @@ def _parse_ma_hits(kind: str, hits: list[dict]) -> list[dict]:
             if not m:
                 continue
             company = (dn.split("(")[0] or "").strip()
+            if _NON_COMMON_RE.search(company):           # SPAC（Acquisition Corp）・ファンド等
+                continue
             cik = str(ciks[i] if i < len(ciks) else (ciks[0] if ciks else "")).lstrip("0")
             url = (f"https://www.sec.gov/Archives/edgar/data/{cik}/{adsh.replace('-', '')}/{fname}"
                    if cik and adsh and fname else
                    f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}")
+            k = "deal" if (kind == "strategic" and _MA_EX21_RE.search(fname or "")) else kind
             for tk in m.group(1).split(","):
                 tk = _norm_ticker(tk)
+                # 優先株（PCG-PX）・SPAC のワラント/ユニット/権利（5文字目 W/U/R）は普通株ではない
+                if not tk or "-" in tk or (len(tk) == 5 and tk[-1] in "WUR"):
+                    continue
                 if tk:
-                    out.append({"id": f"{adsh}|{tk}|{kind}", "kind": kind, "ticker": tk,
+                    out.append({"id": f"{adsh}|{tk}|{k}", "kind": k, "ticker": tk,
                                 "name": company, "form": src.get("form") or src.get("file_type") or "",
                                 "date": str(src.get("file_date") or "")[:10], "url": url})
     return out
+
+
+def _ma_keep(r: dict) -> bool:
+    """保存済み履歴にも現在の基準を当てる（優先株・SPAC証券・Ex2.1 を戦略的選択肢に入れた旧分類を捨てる）。"""
+    tk, name = r.get("ticker", ""), r.get("name", "")
+    if "-" in tk or (len(tk) == 5 and tk[-1] in "WUR") or _NON_COMMON_RE.search(name):
+        return False
+    fname = str(r.get("url", "")).rsplit("/", 1)[-1]
+    return not (r.get("kind") == "strategic" and _MA_EX21_RE.search(fname))   # 次の取得で買収合意として入り直す
 
 
 def fetch_ma_signals() -> dict:
@@ -1919,7 +1939,8 @@ def fetch_ma_signals() -> dict:
     """
     try:
         hist = json.loads(MA_FILE.read_text(encoding="utf-8"))
-        recs = {r["id"]: r for r in hist.get("records", []) if isinstance(r, dict) and r.get("id")}
+        recs = {r["id"]: r for r in hist.get("records", []) if isinstance(r, dict) and r.get("id")
+                and _ma_keep(r)}
     except Exception:
         recs = {}
     today = datetime.now(tz=ET).date()
@@ -1981,9 +2002,10 @@ def _ma_section(ma: dict | None, amap: dict, focus: dict[str, str]) -> str:
     def pick(rows: list[dict]) -> list[dict]:
         """同じ銘柄・種別は最新1件。分析対象の銘柄を先に、各群は新しい順で最大 MA_ROWS_PER_GROUP 件。"""
         seen, uniq = set(), []
-        for r in sorted(rows, key=lambda r: r["date"], reverse=True):
-            if (r["ticker"], r["kind"]) not in seen:
-                seen.add((r["ticker"], r["kind"])); uniq.append(r)
+        for r in sorted(rows, key=lambda r: (r["date"], r["ticker"] in amap, -len(r["ticker"])), reverse=True):
+            key_t, key_n = (r["ticker"], r["kind"]), (r["name"].lower(), r["kind"])
+            if key_t not in seen and key_n not in seen:      # 同じ会社の別ティッカー（PERF/PERFF）は1行
+                seen.add(key_t); seen.add(key_n); uniq.append(r)
         return sorted(uniq, key=lambda r: r["ticker"] not in amap)[:MA_ROWS_PER_GROUP]
 
     groups = [("あなたの保有・注目銘柄", [r for r in recent if r["ticker"] in focus]),
