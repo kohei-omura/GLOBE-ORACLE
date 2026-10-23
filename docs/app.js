@@ -139,11 +139,20 @@
       var b = document.createElement('button'); b.className = 'star' + (inWatch(c) ? ' on' : ''); b.setAttribute('data-star', c); b.textContent = inWatch(c) ? '★' : '☆'; r1.appendChild(b);
     }
   }
+  /* M&Aシグナル欄でウォッチ中の銘柄を強調（ウォッチはこの端末のブラウザにだけ保存されている） */
+  function markMaWatch() {
+    document.querySelectorAll('[data-ma-c]').forEach(function (el) {
+      var on = inWatch(el.getAttribute('data-ma-c')), tag = el.querySelector('.ma-watch');
+      el.classList.toggle('watched', on);
+      if (on && !tag) { var t = document.createElement('span'); t.className = 'chip ma-watch'; t.textContent = '★ウォッチ中'; el.insertBefore(t, el.querySelector('.ma-link')); }
+      if (!on && tag) tag.remove();
+    });
+  }
   function syncStars() { var btns = document.querySelectorAll('[data-star]'); for (var i = 0; i < btns.length; i++) { var c = btns[i].getAttribute('data-star'), on = inWatch(c); btns[i].className = 'star' + (on ? ' on' : ''); btns[i].textContent = on ? '★' : '☆'; } }
   document.addEventListener('click', function (ev) {
     var t = ev.target; if (!t || !t.getAttribute) return;
-    var sc = t.getAttribute('data-star'); if (sc) { toggleWatch(sc); syncStars(); renderWatch(); return; }
-    var rm = t.getAttribute('data-rm'); if (rm) { toggleWatch(rm); syncStars(); renderWatch(); return; }
+    var sc = t.getAttribute('data-star'); if (sc) { toggleWatch(sc); syncStars(); renderWatch(); markMaWatch(); return; }
+    var rm = t.getAttribute('data-rm'); if (rm) { toggleWatch(rm); syncStars(); renderWatch(); markMaWatch(); return; }
   });
 
   /* ---- USD⇄JPY トグル ---- */
@@ -247,7 +256,7 @@
   }
 
   function init() {
-    addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus();
+    addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
     tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }
