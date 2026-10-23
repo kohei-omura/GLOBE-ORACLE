@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import traceback
+import warnings
 from datetime import datetime, timezone, timedelta, date, time as dtime
 from functools import lru_cache
 from pathlib import Path
@@ -35,6 +36,10 @@ try:
     import requests
 except Exception:  # pragma: no cover
     requests = None
+
+# yfinance 内部が出す pandas の非推奨警告（inplace=）が1回の実行で数万行出てログを埋め、
+# 肝心のエラーが読めなくなっていたため抑止する（動作には影響しない）。
+warnings.filterwarnings("ignore", message=r".*inplace keyword.*")
 
 JST = timezone(timedelta(hours=9))
 ET = ZoneInfo("America/New_York") if ZoneInfo else timezone(timedelta(hours=-5))
@@ -1869,7 +1874,8 @@ def _sec_search(q: str, forms: str, start: str, end: str, pages: int = 2) -> lis
                                  "startdt": start, "enddt": end, "from": page * 100},
                          headers={"User-Agent": SEC_USER_AGENT, "Accept": "application/json"},
                          timeout=30)
-        r.raise_for_status()
+        if r.status_code != 200:     # 理由を残す（SEC は User-Agent 不備を 403 で返す）
+            raise RuntimeError(f"HTTP {r.status_code}: {' '.join(r.text.split())[:160]}")
         hits = ((r.json() or {}).get("hits") or {}).get("hits") or []
         out.extend(hits)
         if len(hits) < 100:
@@ -1919,6 +1925,7 @@ def fetch_ma_signals() -> dict:
     today = datetime.now(tz=ET).date()
     start = (today - timedelta(days=MA_LOOKBACK_DAYS)).isoformat()
     ok = 0
+    errors: dict[str, str] = {}
     import time as _t
     for kind, q, forms in MA_QUERIES:
         try:
@@ -1928,6 +1935,7 @@ def fetch_ma_signals() -> dict:
             ok += 1
             print(f"M&A {kind}: {len(rows)}件", file=sys.stderr)
         except Exception as e:
+            errors[kind] = str(e)[:200]
             print(f"[globe] M&A {kind} 取得失敗: {e}", file=sys.stderr)
         _t.sleep(0.3)
     cutoff = (today - timedelta(days=MA_HISTORY_DAYS)).isoformat()
@@ -1935,11 +1943,12 @@ def fetch_ma_signals() -> dict:
                      key=lambda r: (r.get("date", ""), r["ticker"]), reverse=True)
     try:
         MA_FILE.write_text(json.dumps({"asof": datetime.now(tz=JST).strftime("%Y-%m-%d %H:%M"),
-                                       "records": records}, ensure_ascii=False, separators=(",", ":")),
+                                       "errors": errors, "records": records},
+                                      ensure_ascii=False, separators=(",", ":")),
                            encoding="utf-8")
     except Exception as e:
         print(f"[globe] {MA_FILE.name} 保存失敗: {e}", file=sys.stderr)
-    return {"ok": ok, "total": len(MA_QUERIES), "records": records}
+    return {"ok": ok, "total": len(MA_QUERIES), "errors": errors, "records": records}
 
 
 def _ma_section(ma: dict | None, amap: dict, focus: dict[str, str]) -> str:
@@ -1988,7 +1997,9 @@ def _ma_section(ma: dict | None, amap: dict, focus: dict[str, str]) -> str:
     warn = ""
     if ma.get("ok", 0) < ma.get("total", 0):
         warn = (f'<span style="color:var(--dn)">⚠ SEC への問い合わせの一部が失敗しました'
-                f'（{ma.get("ok", 0)}/{ma.get("total", 0)}種別のみ最新）。</span> ')
+                f'（{ma.get("ok", 0)}/{ma.get("total", 0)}種別のみ最新）'
+                f'{"：" + _esc(next(iter((ma.get("errors") or {}).values()), ""))[:90] if ma.get("errors") else ""}'
+                f'。</span> ')
     foot = (f'<p class="cfoot">{warn}SEC EDGAR の公開開示から直近{MA_LOOKBACK_DAYS}日分を毎日取得しています。'
             f'13D は投資家が5%超を取得し経営への関与を表明したもの、「戦略的選択肢の検討」は会社が売却を含む'
             f'選択肢を検討していると開示したもので、どちらも買収の前兆になりやすい一方、<b>大半は買収に至りません。</b>'
