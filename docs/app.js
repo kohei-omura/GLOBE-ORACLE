@@ -118,17 +118,19 @@
   var watchSec = null, watchResults = null;
   function ensureWatchSec() {
     if (watchSec) return;
-    watchSec = document.createElement('section'); watchSec.id = 'watch-sec'; watchSec.style.display = 'none';
+    watchSec = document.createElement('section'); watchSec.id = 'watch-sec'; watchSec.className = 'sec'; watchSec.style.display = 'none';
+    watchSec.setAttribute('data-key', 'watch'); watchSec.setAttribute('data-nav', 'ウォッチ');
     watchSec.innerHTML = '<h2 class="find"><span>ウォッチリスト</span><em>WATCHLIST</em></h2><div id="watch-results" class="cards"></div>';
     if (searchSec && searchSec.parentNode) searchSec.parentNode.insertBefore(watchSec, searchSec.nextSibling);
-    watchResults = watchSec.querySelector('#watch-results');
+    watchResults = watchSec.querySelector('#watch-results'); makeFoldable(watchSec);
   }
   function renderWatch() {
     ensureWatchSec(); var w = getWatch();
-    if (!w.length) { watchSec.style.display = 'none'; if (watchResults) watchResults.innerHTML = ''; return; }
+    if (!w.length) { watchSec.style.display = 'none'; if (watchResults) watchResults.innerHTML = ''; buildNav(); return; }
     if (!STOCKS) { ensureStocks(); return; }
     var cards = []; for (var i = 0; i < w.length; i++) { var s = byCode(w[i]); if (s) cards.push(card(s, 'watch')); }
     watchSec.style.display = cards.length ? '' : 'none'; if (watchResults) watchResults.innerHTML = cards.join('');
+    updateCount(watchSec); buildNav();
   }
   function injectStars() {
     var cards = document.querySelectorAll('.card');
@@ -255,8 +257,78 @@
     meta.appendChild(b);
   }
 
+
+  /* ── 折りたたみ（▼）と目次 ── 開閉状態は端末(localStorage)に保存 */
+  var FOLD_KEY = 'go_fold_v1', FOLD_DEFAULT = { ma: 1, cand: 1 };
+  function getFold() { try { var o = JSON.parse(localStorage.getItem(FOLD_KEY) || 'null'); return (o && typeof o === 'object') ? o : null; } catch (e) { return null; } }
+  function saveFold(k, on) { var o = getFold() || JSON.parse(JSON.stringify(FOLD_DEFAULT)); o[k] = on ? 1 : 0; try { localStorage.setItem(FOLD_KEY, JSON.stringify(o)); } catch (e) {} }
+  function isFolded(k) { var o = getFold(); return o ? !!o[k] : !!FOLD_DEFAULT[k]; }
+  function foldSecs() { return Array.prototype.slice.call(document.querySelectorAll('section.sec[data-key]')); }
+  function setFolded(sec, on, save) {
+    sec.classList.toggle('collapsed', !!on);
+    var h = sec.querySelector('.sec-h'); if (h) h.setAttribute('aria-expanded', on ? 'false' : 'true');
+    if (save) saveFold(sec.getAttribute('data-key'), on);
+  }
+  function secCount(sec) { return sec.querySelectorAll('.card, .ma-row').length; }
+  function updateCount(sec) {
+    var c = sec && sec.querySelector('.sec-h .cnt'); if (!c) return;
+    var n = secCount(sec); c.textContent = n ? String(n) : ''; c.style.display = n ? '' : 'none';
+  }
+  function makeFoldable(sec) {
+    if (!sec || sec.querySelector('.sec-h')) return;
+    var h2 = sec.querySelector('h2.find'); if (!h2 || h2.parentNode !== sec) return;
+    var k = sec.getAttribute('data-key');
+    var h = document.createElement('div'); h.className = 'sec-h'; h.setAttribute('role', 'button'); h.tabIndex = 0;
+    sec.insertBefore(h, h2); h.appendChild(h2);
+    var cnt = document.createElement('span'); cnt.className = 'cnt'; h.appendChild(cnt);
+    var ch = document.createElement('span'); ch.className = 'chev'; ch.setAttribute('aria-hidden', 'true'); ch.textContent = '▼'; h.appendChild(ch);
+    var body = document.createElement('div'); body.className = 'sec-body'; body.id = 'body-' + k;
+    var inn = document.createElement('div'); inn.className = 'sec-in'; body.appendChild(inn);
+    while (h.nextSibling) inn.appendChild(h.nextSibling);
+    sec.appendChild(body); h.setAttribute('aria-controls', body.id);
+    function toggle() { setFolded(sec, !sec.classList.contains('collapsed'), true); syncAllBtn(); }
+    h.addEventListener('click', function (e) { if (e.target.closest && e.target.closest('a,button,input')) return; toggle(); });
+    h.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+    setFolded(sec, isFolded(k), false); updateCount(sec);
+  }
+  function syncAllBtn() {
+    var b = document.getElementById('navall'); if (!b) return;
+    var anyOpen = foldSecs().some(function (s) { return s.style.display !== 'none' && !s.classList.contains('collapsed'); });
+    b.textContent = anyOpen ? '▲ すべて閉じる' : '▼ すべて開く';
+  }
+  function buildNav() {
+    var nav = document.getElementById('nav'); if (!nav) return;
+    var html = [];
+    if (document.getElementById('q')) html.push('<a href="#search-sec" data-go="search">🔍 検索</a>');
+    foldSecs().forEach(function (s) {
+      if (s.style.display === 'none') return;
+      var n = secCount(s);
+      html.push('<a href="#' + esc(s.id) + '" data-go="' + esc(s.getAttribute('data-key')) + '">' + esc(s.getAttribute('data-nav') || '') +
+        (n ? '<span class="n">' + n + '</span>' : '') + '</a>');
+    });
+    html.push('<button type="button" id="navall"></button>');
+    nav.innerHTML = html.join(''); syncAllBtn();
+  }
+  function initFold() {
+    foldSecs().forEach(makeFoldable); buildNav();
+    var nav = document.getElementById('nav'); if (!nav || nav._bound) return; nav._bound = 1;
+    nav.addEventListener('click', function (e) {
+      var t = e.target.closest ? e.target.closest('a,button') : null; if (!t) return;
+      if (t.id === 'navall') {
+        var anyOpen = foldSecs().some(function (s) { return s.style.display !== 'none' && !s.classList.contains('collapsed'); });
+        foldSecs().forEach(function (s) { setFolded(s, anyOpen, true); }); syncAllBtn(); return;
+      }
+      var k = t.getAttribute('data-go');
+      if (k === 'search') { e.preventDefault(); var q = document.getElementById('q'); var ss = document.getElementById('search-sec');
+        if (ss) ss.scrollIntoView({ behavior: 'smooth', block: 'start' }); if (q) setTimeout(function () { q.focus({ preventScroll: true }); }, 350); return; }
+      var sec = document.querySelector('section.sec[data-key="' + k + '"]');
+      if (sec) { e.preventDefault(); if (sec.classList.contains('collapsed')) { setFolded(sec, false, true); syncAllBtn(); }
+        sec.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+    });
+  }
+
   function init() {
-    addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch();
+    initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
     tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }
