@@ -63,8 +63,8 @@ HOLDINGS_FILE = Path("holdings.txt")
 
 
 def load_holdings() -> list[dict]:
-    """holdings.txt を読む。1行 = 「ティッカー,買値[,利確,損切]」。#はコメント。
-    例: SOFI,18.68  /  AAPL,180,210,165"""
+    """holdings.txt を読む。1行 = 「ティッカー,買値[,利確,損切][,株数株]」。#はコメント。
+    例: SOFI,18.68  /  AAPL,180,210,165  /  GOOGL,292.85,10株（株数は「株」を付けて任意の位置）"""
     out: list[dict] = []
     if not HOLDINGS_FILE.exists():
         return out
@@ -74,10 +74,16 @@ def load_holdings() -> list[dict]:
             if not s or s.startswith("#"):
                 continue
             parts = [p.strip() for p in s.replace("\t", ",").split(",") if p.strip() != ""]
+            qty = None
+            for q in [p for p in parts[1:] if re.fullmatch(r"\d+(?:\.\d+)?\s*株", p)]:
+                qty = float(q.rstrip("株").strip())
+                parts.remove(q)
             if len(parts) < 2:
                 continue
             try:
                 rec = {"code": _norm_ticker(parts[0]), "avg": float(parts[1])}
+                if qty and qty > 0:
+                    rec["qty"] = qty
                 if len(parts) >= 3:
                     rec["tgt"] = float(parts[2])
                 if len(parts) >= 4:
@@ -193,7 +199,8 @@ CANDIDATES_FILE = DOCS / "candidates.json"
 # 機能1: メディア注目リスト（candidates_media.txt が無ければ内蔵デフォルトを使用）
 #   内蔵デフォルト asof 2026-07 ／ 出典＝アナリスト予想・予測市場
 MEDIA_FILE = Path("candidates_media.txt")
-MEDIA_DEFAULT = ["SOFI", "ALNY", "RDDT", "PSTG", "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR"]
+MEDIA_DEFAULT = ["SOFI", "ALNY", "RDDT", "P",   # P = Everpure（旧 Pure Storage・PSTG から改称）
+                  "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR"]
 
 
 def _load_media() -> list[tuple[str, str]]:
@@ -215,7 +222,7 @@ def _load_media() -> list[tuple[str, str]]:
         out = [(t, "") for t in MEDIA_DEFAULT]
     return out
 CANDIDATE_SEED = [  # スクリーナー失敗時のフォールバック（SOFI級の準大型・成長株）
-    "SOFI", "RDDT", "ALNY", "PSTG", "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR",
+    "SOFI", "RDDT", "ALNY", "P", "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR",
     "HOOD", "DKNG", "TOST", "CELH", "SNOW",
 ]
 
@@ -761,8 +768,12 @@ def rank_growth(feats: dict[str, dict]) -> None:
 # ─────────────────────────────────────────────
 #  データ取得（一括バッチ）＋ファンダ（上位のみ）
 # ─────────────────────────────────────────────
+RETRY_MAX = 30   # 取りこぼしの取り直し上限（上場廃止だらけの大きな母集団で時間を浪費しない）
+
+
 def _download_batch(tickers: list[str], period: str = "1y",
-                    chunk: int = 100, pause: float = 0.0) -> dict[str, pd.DataFrame]:
+                    chunk: int = 100, pause: float = 0.0,
+                    retry: bool = True, threads: bool = True) -> dict[str, pd.DataFrame]:
     """日足を一括取得。chunk=1回のリクエスト銘柄数、pause=チャンク間の待機秒（レート制限対策）。"""
     import yfinance as yf
     import time as _t
@@ -775,16 +786,18 @@ def _download_batch(tickers: list[str], period: str = "1y",
         for attempt in range(2):
             try:
                 data = yf.download(part, period=period, interval="1d",
-                                   auto_adjust=True, threads=True, group_by="ticker",
+                                   auto_adjust=True, threads=threads, group_by="ticker",
                                    progress=False)
                 if data is None or len(data) == 0:
                     raise RuntimeError("empty")
                 for t in part:
                     try:
-                        if len(part) == 1:
-                            df = data
-                        else:
+                        # group_by="ticker" では1銘柄でも列が (ティッカー, 項目) の2段になる。
+                        # 以前は1銘柄のとき data をそのまま使い、列名が合わず必ず空になっていた。
+                        if isinstance(data.columns, pd.MultiIndex):
                             df = data[t] if t in data.columns.get_level_values(0) else None
+                        else:
+                            df = data
                         if df is None or df.dropna(how="all").empty:
                             continue
                         df = df.rename(columns=str.title)
@@ -798,6 +811,11 @@ def _download_batch(tickers: list[str], period: str = "1y",
             except Exception as e:
                 if attempt == 1:
                     print(f"[globe] chunk {i//CHUNK} 取得失敗: {e}", file=sys.stderr)
+    # 並列取得では yfinance 内部の SQLite キャッシュが「database is locked」になり、
+    # 正常な銘柄（例: AVGO）が黙って抜けることがある。少数の取りこぼしだけ直列で取り直す。
+    miss = [t for t in tickers if t not in out]
+    if retry and miss and len(miss) <= RETRY_MAX:
+        out.update(_download_batch(miss, period, chunk=len(miss), pause=0, retry=False, threads=False))
     return out
 
 
@@ -847,6 +865,9 @@ def _fetch_fundamentals(codes: list[str]) -> dict[str, dict]:
                 "book": info.get("bookValue"),
                 "sector": info.get("sector"),
                 "name": info.get("shortName") or info.get("longName"),
+                # 次回決算（UTC秒）。発表済みの間は前回の日付が残るので、表示側で未来の日付だけ使う
+                "earn": info.get("earningsTimestampStart") or info.get("earningsTimestamp"),
+                "earn_est": bool(info.get("isEarningsDateEstimate")),
             }
         except Exception as e:
             print(f"[globe] info失敗 {c}: {e}", file=sys.stderr)
@@ -901,7 +922,8 @@ def _fund_adjust(a: Analysis, f: dict) -> None:
         pass
     a.fund = {"per": per, "pbr": pbr, "roe": roe, "div": div,
               "target_mean": tm, "target_pct": tpct, "reco": f.get("reco"),
-              "fair": fair, "fair_gap": fair_gap, "valuation": valuation}
+              "fair": fair, "fair_gap": fair_gap, "valuation": valuation,
+              "earn": f.get("earn"), "earn_est": f.get("earn_est")}
 
 
 def _extract_quotes(res) -> list:
@@ -1232,6 +1254,8 @@ def _info_one(yf, code: str) -> dict | None:
             "sector": info.get("sector") or "",
             "rev_g": info.get("revenueGrowth"),
             "eps_g": info.get("earningsQuarterlyGrowth"),
+            "earn": info.get("earningsTimestampStart") or info.get("earningsTimestamp"),
+            "earn_est": bool(info.get("isEarningsDateEstimate")),
             "name": info.get("shortName") or info.get("longName") or ""}
 
 
@@ -1366,6 +1390,7 @@ def _select_growth(cands: list[str], feats: dict[str, dict], conf: dict[str, dic
             f["sector"] = d["sector"]
             f["rev_g"] = None if d["rev_g"] is None else round(d["rev_g"] * 100.0, 0)
             f["name"] = d["name"]
+            f["earn"], f["earn_est"] = d.get("earn"), d.get("earn_est")
     return sorted(keep, key=lambda c: (-feats[c]["score"], c))
 
 
@@ -1568,6 +1593,12 @@ def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict, l
             except Exception as e:
                 print(f"[globe] 候補分析失敗 {c}: {e}", file=sys.stderr)
 
+    # 価格も時価総額も取れない候補（上場廃止・改称で消えたティッカー）は空カードになるので外す
+    gone = [x["c"] for x in cands if x["c"] not in frames and not x.get("mcap")]
+    if gone:
+        print(f"[globe] 候補から除外（データなし・改称/廃止の可能性）: {', '.join(gone)}", file=sys.stderr)
+        cands = [x for x in cands if x["c"] not in gone]
+
     # ── 大化け候補レーダー（2桁株）TOP5 ──
     growth: list[Analysis] = []
     try:
@@ -1627,15 +1658,19 @@ def _esc(s) -> str:
 
 
 def _sector_short(sec: str) -> str:
+    """業種を日本語の短い名前にする（Wikipedia の GICS 名と yfinance の業種名の両方に対応）。"""
     m = {
-        "Information Technology": "Tech", "Technology": "Tech",
-        "Communication Services": "Comm", "Communication": "Comm",
-        "Consumer Discretionary": "Cons.D", "Consumer Staples": "Cons.S",
-        "Health Care": "Health", "Financials": "Fin", "Industrials": "Indust",
-        "Energy": "Energy", "Materials": "Matr", "Utilities": "Util",
-        "Real Estate": "REIT",
+        "Information Technology": "IT", "Technology": "IT",
+        "Communication Services": "通信", "Communication": "通信",
+        "Consumer Discretionary": "一般消費財", "Consumer Cyclical": "一般消費財",
+        "Consumer Staples": "生活必需品", "Consumer Defensive": "生活必需品",
+        "Health Care": "ヘルスケア", "Healthcare": "ヘルスケア",
+        "Financials": "金融", "Financial Services": "金融", "Financial": "金融",
+        "Industrials": "資本財",
+        "Energy": "エネルギー", "Materials": "素材", "Basic Materials": "素材",
+        "Utilities": "公益", "Real Estate": "不動産",
     }
-    return m.get(sec, (sec[:5] if sec else ""))
+    return m.get(sec, (sec[:6] if sec else ""))
 
 
 def _usd(v) -> str:
@@ -1719,8 +1754,38 @@ def _card(rank: int, a: Analysis, show_levels: bool) -> str:
         f'<span class="name">{_esc(a.name)}</span>{seg_html}</div>{_badge(a.g)}</div>'
         f'<div class="row2"><span class="price" data-px="{_esc(a.code)}" data-usd="{a.price}">{_usd(a.price)}</span>'
         f'<span class="score {scls}">{"+" if a.sc>=0 else ""}{a.sc}</span>{_score_bar(a.sc)}</div>'
-        f'{levels}{an}{fair}{ez_html}{fund}{bt}{reasons}</div>'
+        f'{levels}{_earn_html(a.fund.get("earn"), a.fund.get("earn_est")) if a.fund else ""}'
+        f'{an}{fair}{ez_html}{fund}{bt}{reasons}</div>'
     )
+
+
+EARN_SOON_DAYS = 14    # この日数以内の決算は警告（新規買い・持ち越しの判断材料）
+EARN_SHOW_DAYS = 60    # これより先の決算は表示しない
+
+
+EARN_NOTE = {False: "発表で損切りを飛び越えて下がることあり。新規買いは発表後に",
+             True: "発表で損切りを飛び越えて下がることあり。持ち越すか（一部利確するか）を事前に決める"}
+
+
+def _earn_html(ts, est=False, now: datetime | None = None, held: bool = False) -> str:
+    """次回決算の表示（JS の earnHtml と同じ）。過去の日付・遠すぎる日付は出さない。
+    決算発表では株価が窓を開けて動き、損切ラインを飛び越えて約定することがある。"""
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    d = datetime.fromtimestamp(ts, tz=ET).date()
+    days = (d - (now or _et_now()).date()).days
+    if days < 0 or days > EARN_SHOW_DAYS:
+        return ""
+    when = "今日" if days == 0 else f"あと{days}日"
+    lab = f'📅 決算 {d.month}/{d.day}{"（予定）" if est else ""}・{when}'
+    if days <= EARN_SOON_DAYS:
+        return (f'<div class="earn soon" data-earn="{int(ts)}" data-est="{1 if est else ""}" data-held="{1 if held else ""}">{lab}'
+                f'<span class="ezn">{EARN_NOTE[bool(held)]}</span></div>')
+    return f'<div class="earn" data-earn="{int(ts)}" data-est="{1 if est else ""}" data-held="{1 if held else ""}">{lab}</div>'
 
 
 def _keyed(section_html: str, key: str, label: str) -> str:
@@ -1810,7 +1875,7 @@ def _growth_card(rank: int, a: Analysis) -> str:
         f'<span class="price" data-px="{_esc(a.code)}" data-usd="{a.price}">{_usd(a.price)}</span>'
         f'<span class="gscore">爆発力 {gsc:.0f}</span>'
         f'<span class="bar"><span class="bar-g" style="width:{_clip(gsc, 0.0, 100.0):.0f}%"></span></span>'
-        f'</div>{chips_html}{warn}</div>'
+        f'</div>{chips_html}{warn}{_earn_html(gr.get("earn"), gr.get("earn_est"))}</div>'
     )
 
 
@@ -2166,13 +2231,19 @@ background:linear-gradient(140deg,rgba(240,207,115,.28),rgba(255,255,255,.02) 40
 .pl.up,.pl .up{color:var(--up)}.pl.dn,.pl .dn{color:var(--dn)}
 .pl .hit{margin-left:8px;font-size:12px}
 .hnote{font-size:11px;color:var(--mut);margin-left:8px;font-weight:600}
+.pl .hnote,.pl .amt{display:inline-block;white-space:nowrap}
 .hbasis{display:block;margin:6px 2px 0;font-weight:600}
 .hold-sum{margin:0 0 12px;padding:14px 16px;border:1px solid rgba(240,207,115,.22);border-radius:var(--r);
 background:linear-gradient(135deg,rgba(240,207,115,.10),rgba(20,30,58,.6));font-size:13px;color:var(--fg);box-shadow:var(--shadow)}
 .hold-sum b{font-size:16px}.hold-sum b.up{color:var(--up)}.hold-sum b.dn{color:var(--dn)}
 .hold-sum-note{color:var(--mut);font-size:10.5px;margin-left:6px}
+.hold-risk{margin-top:6px;font-size:12px;color:var(--mut)}.hold-risk b{color:var(--dn);font-size:13px}
+.pl .amt{margin-left:8px;font-size:14px}.pl .amt small{font-size:10.5px;color:var(--mut);font-weight:700;margin-left:2px}
 .ez{margin-top:10px;font-size:12.5px;font-weight:800;color:var(--fg);background:rgba(255,255,255,.035);border:1px solid var(--line);border-radius:12px;padding:8px 12px}
 .ez.hit{background:rgba(61,220,132,.12);border-color:rgba(61,220,132,.5)}
+.earn{margin-top:10px;font-size:12px;font-weight:700;color:var(--mut)}
+.earn.soon{font-size:12.5px;font-weight:800;color:#ffd38a;background:rgba(255,190,90,.08);border:1px solid rgba(255,190,90,.35);border-radius:12px;padding:8px 12px}
+.earn.soon .ezn{display:block;margin:2px 0 0;color:var(--mut)}
 .ez.hit b{color:var(--buy)}
 .ezn{margin-left:8px;font-size:11px;font-weight:700;color:var(--mut)}
 .fund,.bt,.reasons{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
@@ -2287,6 +2358,26 @@ APP_JS = r"""
   function bar(sc) { var p = Math.max(-100, Math.min(100, sc)) / 100; if (p >= 0) return '<span class="bar"><span class="bar-pos" style="width:' + (p * 50) + '%"></span></span>'; return '<span class="bar"><span class="bar-neg" style="width:' + (Math.abs(p) * 50) + '%;margin-left:' + (50 - Math.abs(p) * 50) + '%"></span></span>'; }
   function starBtn(c) { var on = inWatch(c); return '<button class="star' + (on ? ' on' : '') + '" data-star="' + esc(c) + '">' + (on ? '★' : '☆') + '</button>'; }
 
+  /* 次回決算（Python の _earn_html と同じ表示）。日数は開いた時点で数え直す */
+  function etDate(ms) { try { var p = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'numeric', day: 'numeric' }).formatToParts(new Date(ms)), o = {}; p.forEach(function (x) { o[x.type] = +x.value; }); return o; } catch (e) { var d = new Date(ms - 5 * 3600000); return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() }; } }
+  function earnHtml(ts, est, held) {
+    ts = Number(ts); if (!(ts > 0)) return '';
+    var e = etDate(ts * 1000), n = etDate(Date.now());
+    var days = Math.round((Date.UTC(e.year, e.month - 1, e.day) - Date.UTC(n.year, n.month - 1, n.day)) / 86400000);
+    if (days < 0 || days > 60) return '';
+    var lab = '📅 決算 ' + e.month + '/' + e.day + (est ? '（予定）' : '') + '・' + (days === 0 ? '今日' : 'あと' + days + '日');
+    var attrs = ' data-earn="' + ts + '" data-est="' + (est ? 1 : '') + '" data-held="' + (held ? 1 : '') + '"';
+    if (days <= 14) return '<div class="earn soon"' + attrs + '>' + lab + '<span class="ezn">' +
+      (held ? '発表で損切りを飛び越えて下がることあり。持ち越すか（一部利確するか）を事前に決める' : '発表で損切りを飛び越えて下がることあり。新規買いは発表後に') + '</span></div>';
+    return '<div class="earn"' + attrs + '>' + lab + '</div>';
+  }
+  function refreshEarn() {
+    document.querySelectorAll('.earn[data-earn]').forEach(function (el) {
+      var h = earnHtml(el.getAttribute('data-earn'), el.getAttribute('data-est'), el.getAttribute('data-held'));
+      if (!h) { el.parentNode.removeChild(el); return; }
+      var t = document.createElement('div'); t.innerHTML = h; el.parentNode.replaceChild(t.firstChild, el);
+    });
+  }
   function card(s, mode) {
     var scls = s.sc >= 0 ? 'pos' : 'neg';
     var seg = s.m ? '<span class="seg">' + esc(s.m) + '</span>' : '';
@@ -2306,7 +2397,7 @@ APP_JS = r"""
       badge(s.g) + starBtn(s.c) + rm + '</div>' +
       '<div class="row2"><span class="price" data-px="' + c + '" data-usd="' + esc(s.p) + '">' + fmtMoney(s.p) + '</span>' +
       '<span class="score ' + scls + '">' + (s.sc >= 0 ? '+' : '') + s.sc + '</span>' + bar(s.sc) + '</div>' +
-      levels + an + fair + reasons +
+      levels + (s.e ? earnHtml(s.e, s.ee) : '') + an + fair + reasons +
       '<div class="reasons"><span class="chip">スコア順 ' + (s.rk || '-') + ' 位 / ' + TOTAL + ' 銘柄</span></div></div>';
   }
   /* 検索キー（社名＋ティッカー）はクライアントで生成してキャッシュ（stocks.json を軽くするため） */
@@ -2399,7 +2490,7 @@ APP_JS = r"""
   /* ---- USD⇄JPY トグル ---- */
   function reformatMoney() {
     document.querySelectorAll('[data-usd]').forEach(function (el) { el.textContent = fmtMoney(el.getAttribute('data-usd')); });
-    if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderTrades();
+    if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderTrades(); renderHolds();
   }
   function addJpyBtn() {
     var meta = document.querySelector('header .meta'); if (!meta || document.getElementById('jpybtn')) return;
@@ -2411,25 +2502,46 @@ APP_JS = r"""
 
   /* ---- ライブ価格 ---- */
   /* 保有カードの損益と利確・損切の到達状況（サーバ側 _hold_pl_html と同じ表示） */
-  function holdPl(price, avg, tgt, stp) {
+  function holdPl(price, avg, tgt, stp, qty) {
     var pct = avg ? Math.round((price - avg) / avg * 1000) / 10 : 0, cls = pct >= 0 ? 'up' : 'dn', hit = '';
     if (stp && price <= stp) hit = '<b class="hit dn">⚠ 損切ライン到達</b>';
     else if (tgt && price >= tgt) hit = '<b class="hit up">✅ 利確ライン到達</b>';
     var dist = (!hit && price > 0 && tgt && stp) ? '<span class="hnote">利確まで +' + ((tgt - price) / price * 100).toFixed(1) +
       '% ／ 損切まで -' + ((price - stp) / price * 100).toFixed(1) + '%</span>' : '';
-    return '<span class="' + cls + '">損益 ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>' + hit +
+    var amt = '';
+    if (qty > 0 && avg) {
+      var v = (price - avg) * qty;
+      amt = '<span class="amt ' + (v >= 0 ? 'up' : 'dn') + '">' + (v >= 0 ? '+' : '−') + fmtMoney(Math.abs(v)) + '<small>（' + qty + '株）</small></span>';
+      if (stp) amt += '<span class="hnote">損切りなら ' + (stp >= avg ? '+' : '−') + fmtMoney(Math.abs((stp - avg) * qty)) + '</span>';
+    }
+    return '<span class="' + cls + '">損益 ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>' + amt + hit +
       '<span class="hnote">買値 ' + fmtMoney(avg) + ' → 現値 ' + fmtMoney(price) + '</span>' + dist;
+  }
+  /* 保有の損益行とサマリーを、カードに表示中の現値から描き直す（価格更新・円/ドル切替の両方で呼ぶ） */
+  function renderHolds() {
+    var rows = [];
+    document.querySelectorAll('[data-hold-c]').forEach(function (el) {
+      var cardEl = el.closest('.card'), pe = cardEl && cardEl.querySelector('.price[data-usd]');
+      var price = pe ? parseFloat(pe.getAttribute('data-usd')) : 0; if (!(price > 0)) return;
+      var avg = parseFloat(el.getAttribute('data-avg')) || 0, tgt = parseFloat(el.getAttribute('data-tgt')) || 0,
+        stp = parseFloat(el.getAttribute('data-stp')) || 0, qty = parseFloat(el.getAttribute('data-qty')) || 0;
+      el.innerHTML = holdPl(price, avg, tgt, stp, qty); rows.push([avg, price, qty, stp]);
+    });
+    var box = document.getElementById('holdsum'); if (!box || !rows.length) return;
+    var real = rows.every(function (r) { return r[2] > 0; }), tot = 0, win = 0, risk = 0;
+    rows.forEach(function (r) { tot += (r[1] - r[0]) * (real ? r[2] : 1); if (r[1] >= r[0]) win++; if (real && r[3]) risk += Math.max(0, (r[0] - r[3]) * r[2]); });
+    var R = rateNow();
+    box.innerHTML = '💼 合計評価損益 <b class="' + (tot >= 0 ? 'up' : 'dn') + '">' + (tot >= 0 ? '+' : '−') + fmtMoney(Math.abs(tot)) + '</b>' +
+      (jpyOn() ? '' : '（¥換算 ' + yen(tot * R) + '）') + '／ 含み益' + win + '銘柄・含み損' + (rows.length - win) + '銘柄' +
+      (real ? '' : '<span class="hold-sum-note">（1株あたり合算・holdings.txt に「10株」と書くと実額表示）</span>') +
+      (risk > 0 ? '<div class="hold-risk">損切りが全部当たった時の損失 <b>−' + fmtMoney(risk) + '</b>' + (jpyOn() ? '' : '（' + yen(risk * R) + '）') + '</div>' : '');
   }
   function applyPrices(map) {
     /* 損益の行も現値に追従させる（以前は生成時の株価のままで、上の現値と食い違っていた） */
-    document.querySelectorAll('[data-hold-c]').forEach(function (el) {
-      var c = el.getAttribute('data-hold-c'); if (map[c] == null) return;
-      el.innerHTML = holdPl(Number(map[c]), parseFloat(el.getAttribute('data-avg')) || 0,
-        parseFloat(el.getAttribute('data-tgt')) || 0, parseFloat(el.getAttribute('data-stp')) || 0);
-    });
     document.querySelectorAll('[data-px]').forEach(function (el) {
       var c = el.getAttribute('data-px'); if (map[c] != null) { el.setAttribute('data-usd', map[c]); el.textContent = fmtMoney(map[c]); }
     });
+    renderHolds();
     document.querySelectorAll('.ez[data-ez-c]').forEach(function (el) {
       var c = el.getAttribute('data-ez-c'), limit = parseFloat(el.getAttribute('data-ez-limit'));
       if (map[c] == null || !limit) return; var pr = Number(map[c]);
@@ -2470,7 +2582,7 @@ APP_JS = r"""
         if (d.px) applyPrices(d.px);
         if (d.idx) applyIndices(d.idx);
         var lab = document.getElementById('pxasof'); if (lab && d.asof) lab.textContent = '株価 ' + d.asof + ' 時点（約15分遅延）';
-        setMktStatus(); if (q && q.value.trim()) run(); renderWatch(); renderSizing();
+        setMktStatus(); if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderHolds();   /* 為替更新後に円換算をやり直す */
       })
       .catch(function (e) { console.warn('[globe] prices取得失敗', e); });
   }
@@ -2515,7 +2627,7 @@ APP_JS = r"""
       if (n < 1) out.push('<div class="sz warn">📐 1株でも許容損失（' + yen(riskYen) + '）を超えます → 見送り推奨</div>');
       else out.push('<div class="sz">📐 推奨 <b>' + n + '株</b>（約' + yen(n * px * R) + '・資金の' + Math.round(n * px * R / r.cap * 100) + '%）' +
         '<span class="szn">損切り時 −' + yen(n * perShare * R) + (byCap < byRisk ? '・1銘柄25%上限' : '') + '</span></div>');
-    } else out.push('<div class="sz mute">📐 「取引コーチ」で運用資金を入れると推奨株数を表示します</div>');
+    }   /* 資金が未設定のときは全カードに同じ案内を出さない（案内は取引コーチ欄に1回だけ） */
     if (gain > 0 && gain < MIN_EDGE) out.push('<div class="sz warn">⚠ 利確幅 +' + gain.toFixed(1) + '% は特定口座の往復手数料（約1%）で半分以上消えます</div>');
     else if (gain > 0) out.push('<div class="sz mute">手数料込み（特定）：利確 +' + (gain - FEE_RT * 100).toFixed(1) + '% ／ 損切 −' + (loss + FEE_RT * 100).toFixed(1) + '%</div>');
     return out.join('');
@@ -2660,7 +2772,8 @@ APP_JS = r"""
       '<li><b>損切りは買う前に決める</b> — 損切ライン到達で即売り。−8%を超えて持たない</li>' +
       '<li><b>特定口座は利確幅 +2% 以上だけ</b> — 往復手数料が約1%かかる</li>' +
       '<li><b>NISAは長期保有用</b> — 短期売買は枠を消費し、損失も通算できない</li>' +
-      '<li><b>1銘柄は資金の25%まで</b>・<b>当日の往復売買はしない</b></li></ol>' +
+      '<li><b>1銘柄は資金の25%まで</b>・<b>当日の往復売買はしない</b></li>' +
+      '<li><b>決算2週間前からは新規で買わない</b> — 発表で損切りを飛び越えて下がることがある（カードの📅）</li></ol>' +
       '<div class="cimp"><label class="cbtn">📥 SBIの約定履歴CSVを読み込む<input id="trfile" type="file"></label>' +
       '<button type="button" id="trclr" class="cbtn ghost">消去</button></div>' +
       '<p class="cnote">CSVはこの端末の中だけで処理・保存され、どこにも送信されません。</p><div id="trstats"></div>';
@@ -2764,7 +2877,7 @@ APP_JS = r"""
   }
 
   function init() {
-    renderCoach(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
+    renderCoach(); renderHolds(); refreshEarn(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
     tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }
@@ -2855,6 +2968,8 @@ def _to_stock_json(a: Analysis, rank: int) -> dict:
         "p": a.price, "sc": a.sc, "g": a.g, "m": _sector_short(a.sector),
         "t": a.tgt, "st": a.stp, "rr": a.rr, "r": a.reasons, "tp": tp,
         "val": val, "fg": fg, "rk": rank,
+        **({"e": int(a.fund["earn"]), "ee": 1 if a.fund.get("earn_est") else 0}
+           if a.fund and a.fund.get("earn") else {}),
     }
 
 
@@ -2934,14 +3049,18 @@ def _holding_card(h: dict, amap: dict, valid=None, levels: dict | None = None) -
     a.rr = None
     basis = "手動指定" if (h.get("tgt") or h.get("stp")) else (
         f'買値基準・{lv["set"]}設定' if lv.get("set") else "買値基準")
-    pl = (f'<div class="pl" data-hold-c="{_esc(code)}" data-avg="{avg}" '
-          f'data-tgt="{a.tgt or ""}" data-stp="{a.stp or ""}">{_hold_pl_html(a.price, avg, a.tgt, a.stp)}</div>'
+    qty = h.get("qty") or 0
+    pl = (f'<div class="pl" data-hold-c="{_esc(code)}" data-avg="{avg}" data-qty="{qty or ""}" '
+          f'data-tgt="{a.tgt or ""}" data-stp="{a.stp or ""}">{_hold_pl_html(a.price, avg, a.tgt, a.stp, qty)}</div>'
           f'<div class="hnote hbasis">利確・損切は{basis}（株価が動いても変わりません）</div>')
     base = _card(0, a, True).replace('<span class="rank">0</span>', '<span class="rank">保有</span>')
+    if a.fund and a.fund.get("earn"):
+        base = base.replace(_earn_html(a.fund["earn"], a.fund.get("earn_est")),
+                            _earn_html(a.fund["earn"], a.fund.get("earn_est"), held=True))
     return base[:-6] + pl + "</div>"
 
 
-def _hold_pl_html(price: float, avg: float, tgt, stp) -> str:
+def _hold_pl_html(price: float, avg: float, tgt, stp, qty: float = 0) -> str:
     """損益と利確・損切ラインの到達状況（JS の holdPl と同じ表示）。"""
     pl_pct = round((price - avg) / avg * 100.0, 1) if avg else 0.0
     cls = "up" if pl_pct >= 0 else "dn"
@@ -2954,8 +3073,35 @@ def _hold_pl_html(price: float, avg: float, tgt, stp) -> str:
     if not hit and price > 0 and tgt and stp:
         dist = (f'<span class="hnote">利確まで +{(tgt - price) / price * 100:.1f}% ／ '
                 f'損切まで -{(price - stp) / price * 100:.1f}%</span>')
-    return (f'<span class="{cls}">損益 {"+" if pl_pct >= 0 else ""}{pl_pct}%</span>{hit}'
+    amt = ""
+    if qty and avg:
+        v = (price - avg) * qty
+        amt = (f'<span class="amt {"up" if v >= 0 else "dn"}">{"+" if v >= 0 else "−"}{_usd(abs(v))}'
+               f'<small>（{qty:g}株）</small></span>')
+        if stp:
+            amt += f'<span class="hnote">損切りなら {"+" if stp >= avg else "−"}{_usd(abs((stp - avg) * qty))}</span>'
+    return (f'<span class="{cls}">損益 {"+" if pl_pct >= 0 else ""}{pl_pct}%</span>{amt}{hit}'
             f'<span class="hnote">買値 {_usd(avg)} → 現値 {_usd(price)}</span>{dist}')
+
+
+def _hold_sum_html(rows: list[tuple], usdjpy: float) -> str:
+    """保有サマリー（JS の renderHolds と同じ表示）。rows = (買値, 現値, 株数, 損切)。
+    全銘柄に株数があれば実額、無ければ従来どおり1株あたりの合算。"""
+    if not rows:
+        return ""
+    real = all(q for _, _, q, _ in rows)
+    tot = sum((px - avg) * (q if real else 1) for avg, px, q, _ in rows)
+    win = sum(1 for avg, px, *_ in rows if px >= avg)
+    yen = f"¥{round(tot * usdjpy):,}" if usdjpy else "¥—"
+    note = "" if real else '<span class="hold-sum-note">（1株あたり合算・holdings.txt に「10株」と書くと実額表示）</span>'
+    risk = ""
+    if real:
+        r = sum(max(0.0, (avg - (st or avg)) * q) for avg, px, q, st in rows)
+        if r > 0:
+            risk = f'<div class="hold-risk">損切りが全部当たった時の損失 <b>−{_usd(r)}</b>（¥{round(r * usdjpy):,}）</div>' if usdjpy else ""
+    return (f'<div class="hold-sum" id="holdsum">💼 合計評価損益 '
+            f'<b class="{"up" if tot >= 0 else "dn"}">{"+" if tot >= 0 else "−"}{_usd(abs(tot))}</b>'
+            f'（¥換算 {yen}）／ 含み益{win}銘柄・含み損{len(rows) - win}銘柄{note}{risk}</div>')
 
 
 def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
@@ -2987,16 +3133,12 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
     # 機能4: 保有サマリー行（合計評価損益・¥換算・含み益/含み損 銘柄数）※USDJPYはprices.jsonと同レート
     _res = [(h, amap.get(h.get("code"))) for h in holdings]
     _rv = [(h, a) for h, a in _res if a]
-    hold_sum = ""
-    if _rv:
-        _tot = sum((a.price - (h.get("avg") or 0)) for h, a in _rv)
-        _win = sum(1 for h, a in _rv if a.price >= (h.get("avg") or 0))
-        _los = sum(1 for h, a in _rv if a.price < (h.get("avg") or 0))
-        _yen = f"¥{round(_tot * usdjpy):,}" if usdjpy else "¥—"
-        hold_sum = (f'<div class="hold-sum">💼 合計評価損益 '
-                    f'<b class="{"up" if _tot>=0 else "dn"}">{"+" if _tot>=0 else ""}{_usd(_tot)}</b>'
-                    f'（¥換算 {_yen}）／ 含み益{_win}銘柄・含み損{_los}銘柄'
-                    f'<span class="hold-sum-note">（1株あたり合算）</span></div>')
+    def _hstp(h, a):   # 保有カードと同じ損切（手動 → 買値基準の保存値 → 買値から計算 → 汎用）
+        avg = h.get("avg") or 0
+        lv = (hlevels or {}).get(h.get("code")) or _anchored_levels(avg, a) or {}
+        return h.get("stp") or lv.get("stp") or a.stp
+    hold_sum = _hold_sum_html([(h.get("avg") or 0, a.price, h.get("qty") or 0, _hstp(h, a)) for h, a in _rv],
+                              usdjpy) if _rv else ""
     hold_cards = hold_sum + "".join(_holding_card(h, amap, _valid_tk, hlevels) for h in holdings)
     hold_sec = _section("💼 保有銘柄", "MY HOLDINGS", hold_cards) if holdings else ""
     cand_sec = _candidate_section(cands, cmeta, amap)
@@ -3149,7 +3291,7 @@ def write_prices() -> dict:
                                auto_adjust=True, threads=True, group_by="ticker", progress=False)
             for c in shown:
                 try:
-                    df = data if len(shown) == 1 else (data[c] if c in data.columns.get_level_values(0) else None)
+                    df = (data[c] if c in data.columns.get_level_values(0) else None) if isinstance(data.columns, pd.MultiIndex) else data
                     if df is None:
                         continue
                     df = df.rename(columns=str.title)

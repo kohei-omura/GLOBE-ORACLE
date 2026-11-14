@@ -49,6 +49,26 @@
   function bar(sc) { var p = Math.max(-100, Math.min(100, sc)) / 100; if (p >= 0) return '<span class="bar"><span class="bar-pos" style="width:' + (p * 50) + '%"></span></span>'; return '<span class="bar"><span class="bar-neg" style="width:' + (Math.abs(p) * 50) + '%;margin-left:' + (50 - Math.abs(p) * 50) + '%"></span></span>'; }
   function starBtn(c) { var on = inWatch(c); return '<button class="star' + (on ? ' on' : '') + '" data-star="' + esc(c) + '">' + (on ? '★' : '☆') + '</button>'; }
 
+  /* 次回決算（Python の _earn_html と同じ表示）。日数は開いた時点で数え直す */
+  function etDate(ms) { try { var p = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'numeric', day: 'numeric' }).formatToParts(new Date(ms)), o = {}; p.forEach(function (x) { o[x.type] = +x.value; }); return o; } catch (e) { var d = new Date(ms - 5 * 3600000); return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() }; } }
+  function earnHtml(ts, est, held) {
+    ts = Number(ts); if (!(ts > 0)) return '';
+    var e = etDate(ts * 1000), n = etDate(Date.now());
+    var days = Math.round((Date.UTC(e.year, e.month - 1, e.day) - Date.UTC(n.year, n.month - 1, n.day)) / 86400000);
+    if (days < 0 || days > 60) return '';
+    var lab = '📅 決算 ' + e.month + '/' + e.day + (est ? '（予定）' : '') + '・' + (days === 0 ? '今日' : 'あと' + days + '日');
+    var attrs = ' data-earn="' + ts + '" data-est="' + (est ? 1 : '') + '" data-held="' + (held ? 1 : '') + '"';
+    if (days <= 14) return '<div class="earn soon"' + attrs + '>' + lab + '<span class="ezn">' +
+      (held ? '発表で損切りを飛び越えて下がることあり。持ち越すか（一部利確するか）を事前に決める' : '発表で損切りを飛び越えて下がることあり。新規買いは発表後に') + '</span></div>';
+    return '<div class="earn"' + attrs + '>' + lab + '</div>';
+  }
+  function refreshEarn() {
+    document.querySelectorAll('.earn[data-earn]').forEach(function (el) {
+      var h = earnHtml(el.getAttribute('data-earn'), el.getAttribute('data-est'), el.getAttribute('data-held'));
+      if (!h) { el.parentNode.removeChild(el); return; }
+      var t = document.createElement('div'); t.innerHTML = h; el.parentNode.replaceChild(t.firstChild, el);
+    });
+  }
   function card(s, mode) {
     var scls = s.sc >= 0 ? 'pos' : 'neg';
     var seg = s.m ? '<span class="seg">' + esc(s.m) + '</span>' : '';
@@ -68,7 +88,7 @@
       badge(s.g) + starBtn(s.c) + rm + '</div>' +
       '<div class="row2"><span class="price" data-px="' + c + '" data-usd="' + esc(s.p) + '">' + fmtMoney(s.p) + '</span>' +
       '<span class="score ' + scls + '">' + (s.sc >= 0 ? '+' : '') + s.sc + '</span>' + bar(s.sc) + '</div>' +
-      levels + an + fair + reasons +
+      levels + (s.e ? earnHtml(s.e, s.ee) : '') + an + fair + reasons +
       '<div class="reasons"><span class="chip">スコア順 ' + (s.rk || '-') + ' 位 / ' + TOTAL + ' 銘柄</span></div></div>';
   }
   /* 検索キー（社名＋ティッカー）はクライアントで生成してキャッシュ（stocks.json を軽くするため） */
@@ -161,7 +181,7 @@
   /* ---- USD⇄JPY トグル ---- */
   function reformatMoney() {
     document.querySelectorAll('[data-usd]').forEach(function (el) { el.textContent = fmtMoney(el.getAttribute('data-usd')); });
-    if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderTrades();
+    if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderTrades(); renderHolds();
   }
   function addJpyBtn() {
     var meta = document.querySelector('header .meta'); if (!meta || document.getElementById('jpybtn')) return;
@@ -173,25 +193,46 @@
 
   /* ---- ライブ価格 ---- */
   /* 保有カードの損益と利確・損切の到達状況（サーバ側 _hold_pl_html と同じ表示） */
-  function holdPl(price, avg, tgt, stp) {
+  function holdPl(price, avg, tgt, stp, qty) {
     var pct = avg ? Math.round((price - avg) / avg * 1000) / 10 : 0, cls = pct >= 0 ? 'up' : 'dn', hit = '';
     if (stp && price <= stp) hit = '<b class="hit dn">⚠ 損切ライン到達</b>';
     else if (tgt && price >= tgt) hit = '<b class="hit up">✅ 利確ライン到達</b>';
     var dist = (!hit && price > 0 && tgt && stp) ? '<span class="hnote">利確まで +' + ((tgt - price) / price * 100).toFixed(1) +
       '% ／ 損切まで -' + ((price - stp) / price * 100).toFixed(1) + '%</span>' : '';
-    return '<span class="' + cls + '">損益 ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>' + hit +
+    var amt = '';
+    if (qty > 0 && avg) {
+      var v = (price - avg) * qty;
+      amt = '<span class="amt ' + (v >= 0 ? 'up' : 'dn') + '">' + (v >= 0 ? '+' : '−') + fmtMoney(Math.abs(v)) + '<small>（' + qty + '株）</small></span>';
+      if (stp) amt += '<span class="hnote">損切りなら ' + (stp >= avg ? '+' : '−') + fmtMoney(Math.abs((stp - avg) * qty)) + '</span>';
+    }
+    return '<span class="' + cls + '">損益 ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>' + amt + hit +
       '<span class="hnote">買値 ' + fmtMoney(avg) + ' → 現値 ' + fmtMoney(price) + '</span>' + dist;
+  }
+  /* 保有の損益行とサマリーを、カードに表示中の現値から描き直す（価格更新・円/ドル切替の両方で呼ぶ） */
+  function renderHolds() {
+    var rows = [];
+    document.querySelectorAll('[data-hold-c]').forEach(function (el) {
+      var cardEl = el.closest('.card'), pe = cardEl && cardEl.querySelector('.price[data-usd]');
+      var price = pe ? parseFloat(pe.getAttribute('data-usd')) : 0; if (!(price > 0)) return;
+      var avg = parseFloat(el.getAttribute('data-avg')) || 0, tgt = parseFloat(el.getAttribute('data-tgt')) || 0,
+        stp = parseFloat(el.getAttribute('data-stp')) || 0, qty = parseFloat(el.getAttribute('data-qty')) || 0;
+      el.innerHTML = holdPl(price, avg, tgt, stp, qty); rows.push([avg, price, qty, stp]);
+    });
+    var box = document.getElementById('holdsum'); if (!box || !rows.length) return;
+    var real = rows.every(function (r) { return r[2] > 0; }), tot = 0, win = 0, risk = 0;
+    rows.forEach(function (r) { tot += (r[1] - r[0]) * (real ? r[2] : 1); if (r[1] >= r[0]) win++; if (real && r[3]) risk += Math.max(0, (r[0] - r[3]) * r[2]); });
+    var R = rateNow();
+    box.innerHTML = '💼 合計評価損益 <b class="' + (tot >= 0 ? 'up' : 'dn') + '">' + (tot >= 0 ? '+' : '−') + fmtMoney(Math.abs(tot)) + '</b>' +
+      (jpyOn() ? '' : '（¥換算 ' + yen(tot * R) + '）') + '／ 含み益' + win + '銘柄・含み損' + (rows.length - win) + '銘柄' +
+      (real ? '' : '<span class="hold-sum-note">（1株あたり合算・holdings.txt に「10株」と書くと実額表示）</span>') +
+      (risk > 0 ? '<div class="hold-risk">損切りが全部当たった時の損失 <b>−' + fmtMoney(risk) + '</b>' + (jpyOn() ? '' : '（' + yen(risk * R) + '）') + '</div>' : '');
   }
   function applyPrices(map) {
     /* 損益の行も現値に追従させる（以前は生成時の株価のままで、上の現値と食い違っていた） */
-    document.querySelectorAll('[data-hold-c]').forEach(function (el) {
-      var c = el.getAttribute('data-hold-c'); if (map[c] == null) return;
-      el.innerHTML = holdPl(Number(map[c]), parseFloat(el.getAttribute('data-avg')) || 0,
-        parseFloat(el.getAttribute('data-tgt')) || 0, parseFloat(el.getAttribute('data-stp')) || 0);
-    });
     document.querySelectorAll('[data-px]').forEach(function (el) {
       var c = el.getAttribute('data-px'); if (map[c] != null) { el.setAttribute('data-usd', map[c]); el.textContent = fmtMoney(map[c]); }
     });
+    renderHolds();
     document.querySelectorAll('.ez[data-ez-c]').forEach(function (el) {
       var c = el.getAttribute('data-ez-c'), limit = parseFloat(el.getAttribute('data-ez-limit'));
       if (map[c] == null || !limit) return; var pr = Number(map[c]);
@@ -232,7 +273,7 @@
         if (d.px) applyPrices(d.px);
         if (d.idx) applyIndices(d.idx);
         var lab = document.getElementById('pxasof'); if (lab && d.asof) lab.textContent = '株価 ' + d.asof + ' 時点（約15分遅延）';
-        setMktStatus(); if (q && q.value.trim()) run(); renderWatch(); renderSizing();
+        setMktStatus(); if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderHolds();   /* 為替更新後に円換算をやり直す */
       })
       .catch(function (e) { console.warn('[globe] prices取得失敗', e); });
   }
@@ -277,7 +318,7 @@
       if (n < 1) out.push('<div class="sz warn">📐 1株でも許容損失（' + yen(riskYen) + '）を超えます → 見送り推奨</div>');
       else out.push('<div class="sz">📐 推奨 <b>' + n + '株</b>（約' + yen(n * px * R) + '・資金の' + Math.round(n * px * R / r.cap * 100) + '%）' +
         '<span class="szn">損切り時 −' + yen(n * perShare * R) + (byCap < byRisk ? '・1銘柄25%上限' : '') + '</span></div>');
-    } else out.push('<div class="sz mute">📐 「取引コーチ」で運用資金を入れると推奨株数を表示します</div>');
+    }   /* 資金が未設定のときは全カードに同じ案内を出さない（案内は取引コーチ欄に1回だけ） */
     if (gain > 0 && gain < MIN_EDGE) out.push('<div class="sz warn">⚠ 利確幅 +' + gain.toFixed(1) + '% は特定口座の往復手数料（約1%）で半分以上消えます</div>');
     else if (gain > 0) out.push('<div class="sz mute">手数料込み（特定）：利確 +' + (gain - FEE_RT * 100).toFixed(1) + '% ／ 損切 −' + (loss + FEE_RT * 100).toFixed(1) + '%</div>');
     return out.join('');
@@ -422,7 +463,8 @@
       '<li><b>損切りは買う前に決める</b> — 損切ライン到達で即売り。−8%を超えて持たない</li>' +
       '<li><b>特定口座は利確幅 +2% 以上だけ</b> — 往復手数料が約1%かかる</li>' +
       '<li><b>NISAは長期保有用</b> — 短期売買は枠を消費し、損失も通算できない</li>' +
-      '<li><b>1銘柄は資金の25%まで</b>・<b>当日の往復売買はしない</b></li></ol>' +
+      '<li><b>1銘柄は資金の25%まで</b>・<b>当日の往復売買はしない</b></li>' +
+      '<li><b>決算2週間前からは新規で買わない</b> — 発表で損切りを飛び越えて下がることがある（カードの📅）</li></ol>' +
       '<div class="cimp"><label class="cbtn">📥 SBIの約定履歴CSVを読み込む<input id="trfile" type="file"></label>' +
       '<button type="button" id="trclr" class="cbtn ghost">消去</button></div>' +
       '<p class="cnote">CSVはこの端末の中だけで処理・保存され、どこにも送信されません。</p><div id="trstats"></div>';
@@ -526,7 +568,7 @@
   }
 
   function init() {
-    renderCoach(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
+    renderCoach(); renderHolds(); refreshEarn(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
     tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }
