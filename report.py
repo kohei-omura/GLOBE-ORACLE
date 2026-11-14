@@ -1645,15 +1645,19 @@ def _esc(s) -> str:
 
 
 def _sector_short(sec: str) -> str:
+    """業種を日本語の短い名前にする（Wikipedia の GICS 名と yfinance の業種名の両方に対応）。"""
     m = {
-        "Information Technology": "Tech", "Technology": "Tech",
-        "Communication Services": "Comm", "Communication": "Comm",
-        "Consumer Discretionary": "Cons.D", "Consumer Staples": "Cons.S",
-        "Health Care": "Health", "Financials": "Fin", "Industrials": "Indust",
-        "Energy": "Energy", "Materials": "Matr", "Utilities": "Util",
-        "Real Estate": "REIT",
+        "Information Technology": "IT", "Technology": "IT",
+        "Communication Services": "通信", "Communication": "通信",
+        "Consumer Discretionary": "一般消費財", "Consumer Cyclical": "一般消費財",
+        "Consumer Staples": "生活必需品", "Consumer Defensive": "生活必需品",
+        "Health Care": "ヘルスケア", "Healthcare": "ヘルスケア",
+        "Financials": "金融", "Financial Services": "金融", "Financial": "金融",
+        "Industrials": "資本財",
+        "Energy": "エネルギー", "Materials": "素材", "Basic Materials": "素材",
+        "Utilities": "公益", "Real Estate": "不動産",
     }
-    return m.get(sec, (sec[:5] if sec else ""))
+    return m.get(sec, (sec[:6] if sec else ""))
 
 
 def _usd(v) -> str:
@@ -2533,7 +2537,7 @@ APP_JS = r"""
       if (n < 1) out.push('<div class="sz warn">📐 1株でも許容損失（' + yen(riskYen) + '）を超えます → 見送り推奨</div>');
       else out.push('<div class="sz">📐 推奨 <b>' + n + '株</b>（約' + yen(n * px * R) + '・資金の' + Math.round(n * px * R / r.cap * 100) + '%）' +
         '<span class="szn">損切り時 −' + yen(n * perShare * R) + (byCap < byRisk ? '・1銘柄25%上限' : '') + '</span></div>');
-    } else out.push('<div class="sz mute">📐 「取引コーチ」で運用資金を入れると推奨株数を表示します</div>');
+    }   /* 資金が未設定のときは全カードに同じ案内を出さない（案内は取引コーチ欄に1回だけ） */
     if (gain > 0 && gain < MIN_EDGE) out.push('<div class="sz warn">⚠ 利確幅 +' + gain.toFixed(1) + '% は特定口座の往復手数料（約1%）で半分以上消えます</div>');
     else if (gain > 0) out.push('<div class="sz mute">手数料込み（特定）：利確 +' + (gain - FEE_RT * 100).toFixed(1) + '% ／ 損切 −' + (loss + FEE_RT * 100).toFixed(1) + '%</div>');
     return out.join('');
