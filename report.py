@@ -193,7 +193,8 @@ CANDIDATES_FILE = DOCS / "candidates.json"
 # 機能1: メディア注目リスト（candidates_media.txt が無ければ内蔵デフォルトを使用）
 #   内蔵デフォルト asof 2026-07 ／ 出典＝アナリスト予想・予測市場
 MEDIA_FILE = Path("candidates_media.txt")
-MEDIA_DEFAULT = ["SOFI", "ALNY", "RDDT", "PSTG", "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR"]
+MEDIA_DEFAULT = ["SOFI", "ALNY", "RDDT", "P",   # P = Everpure（旧 Pure Storage・PSTG から改称）
+                  "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR"]
 
 
 def _load_media() -> list[tuple[str, str]]:
@@ -215,7 +216,7 @@ def _load_media() -> list[tuple[str, str]]:
         out = [(t, "") for t in MEDIA_DEFAULT]
     return out
 CANDIDATE_SEED = [  # スクリーナー失敗時のフォールバック（SOFI級の準大型・成長株）
-    "SOFI", "RDDT", "ALNY", "PSTG", "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR",
+    "SOFI", "RDDT", "ALNY", "P", "CVNA", "FIX", "CIEN", "AFRM", "ARES", "MSTR",
     "HOOD", "DKNG", "TOST", "CELH", "SNOW",
 ]
 
@@ -761,8 +762,12 @@ def rank_growth(feats: dict[str, dict]) -> None:
 # ─────────────────────────────────────────────
 #  データ取得（一括バッチ）＋ファンダ（上位のみ）
 # ─────────────────────────────────────────────
+RETRY_MAX = 30   # 取りこぼしの取り直し上限（上場廃止だらけの大きな母集団で時間を浪費しない）
+
+
 def _download_batch(tickers: list[str], period: str = "1y",
-                    chunk: int = 100, pause: float = 0.0) -> dict[str, pd.DataFrame]:
+                    chunk: int = 100, pause: float = 0.0,
+                    retry: bool = True, threads: bool = True) -> dict[str, pd.DataFrame]:
     """日足を一括取得。chunk=1回のリクエスト銘柄数、pause=チャンク間の待機秒（レート制限対策）。"""
     import yfinance as yf
     import time as _t
@@ -775,16 +780,18 @@ def _download_batch(tickers: list[str], period: str = "1y",
         for attempt in range(2):
             try:
                 data = yf.download(part, period=period, interval="1d",
-                                   auto_adjust=True, threads=True, group_by="ticker",
+                                   auto_adjust=True, threads=threads, group_by="ticker",
                                    progress=False)
                 if data is None or len(data) == 0:
                     raise RuntimeError("empty")
                 for t in part:
                     try:
-                        if len(part) == 1:
-                            df = data
-                        else:
+                        # group_by="ticker" では1銘柄でも列が (ティッカー, 項目) の2段になる。
+                        # 以前は1銘柄のとき data をそのまま使い、列名が合わず必ず空になっていた。
+                        if isinstance(data.columns, pd.MultiIndex):
                             df = data[t] if t in data.columns.get_level_values(0) else None
+                        else:
+                            df = data
                         if df is None or df.dropna(how="all").empty:
                             continue
                         df = df.rename(columns=str.title)
@@ -798,6 +805,11 @@ def _download_batch(tickers: list[str], period: str = "1y",
             except Exception as e:
                 if attempt == 1:
                     print(f"[globe] chunk {i//CHUNK} 取得失敗: {e}", file=sys.stderr)
+    # 並列取得では yfinance 内部の SQLite キャッシュが「database is locked」になり、
+    # 正常な銘柄（例: AVGO）が黙って抜けることがある。少数の取りこぼしだけ直列で取り直す。
+    miss = [t for t in tickers if t not in out]
+    if retry and miss and len(miss) <= RETRY_MAX:
+        out.update(_download_batch(miss, period, chunk=len(miss), pause=0, retry=False, threads=False))
     return out
 
 
@@ -1567,6 +1579,12 @@ def analyze_all() -> tuple[list[Analysis], dict, list[dict], list[dict], dict, l
                 analyses.append(a)
             except Exception as e:
                 print(f"[globe] 候補分析失敗 {c}: {e}", file=sys.stderr)
+
+    # 価格も時価総額も取れない候補（上場廃止・改称で消えたティッカー）は空カードになるので外す
+    gone = [x["c"] for x in cands if x["c"] not in frames and not x.get("mcap")]
+    if gone:
+        print(f"[globe] 候補から除外（データなし・改称/廃止の可能性）: {', '.join(gone)}", file=sys.stderr)
+        cands = [x for x in cands if x["c"] not in gone]
 
     # ── 大化け候補レーダー（2桁株）TOP5 ──
     growth: list[Analysis] = []
@@ -3149,7 +3167,7 @@ def write_prices() -> dict:
                                auto_adjust=True, threads=True, group_by="ticker", progress=False)
             for c in shown:
                 try:
-                    df = data if len(shown) == 1 else (data[c] if c in data.columns.get_level_values(0) else None)
+                    df = (data[c] if c in data.columns.get_level_values(0) else None) if isinstance(data.columns, pd.MultiIndex) else data
                     if df is None:
                         continue
                     df = df.rename(columns=str.title)
