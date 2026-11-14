@@ -161,7 +161,7 @@
   /* ---- USD⇄JPY トグル ---- */
   function reformatMoney() {
     document.querySelectorAll('[data-usd]').forEach(function (el) { el.textContent = fmtMoney(el.getAttribute('data-usd')); });
-    if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderTrades();
+    if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderTrades(); renderHolds();
   }
   function addJpyBtn() {
     var meta = document.querySelector('header .meta'); if (!meta || document.getElementById('jpybtn')) return;
@@ -173,25 +173,46 @@
 
   /* ---- ライブ価格 ---- */
   /* 保有カードの損益と利確・損切の到達状況（サーバ側 _hold_pl_html と同じ表示） */
-  function holdPl(price, avg, tgt, stp) {
+  function holdPl(price, avg, tgt, stp, qty) {
     var pct = avg ? Math.round((price - avg) / avg * 1000) / 10 : 0, cls = pct >= 0 ? 'up' : 'dn', hit = '';
     if (stp && price <= stp) hit = '<b class="hit dn">⚠ 損切ライン到達</b>';
     else if (tgt && price >= tgt) hit = '<b class="hit up">✅ 利確ライン到達</b>';
     var dist = (!hit && price > 0 && tgt && stp) ? '<span class="hnote">利確まで +' + ((tgt - price) / price * 100).toFixed(1) +
       '% ／ 損切まで -' + ((price - stp) / price * 100).toFixed(1) + '%</span>' : '';
-    return '<span class="' + cls + '">損益 ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>' + hit +
+    var amt = '';
+    if (qty > 0 && avg) {
+      var v = (price - avg) * qty;
+      amt = '<span class="amt ' + (v >= 0 ? 'up' : 'dn') + '">' + (v >= 0 ? '+' : '−') + fmtMoney(Math.abs(v)) + '<small>（' + qty + '株）</small></span>';
+      if (stp) amt += '<span class="hnote">損切りなら ' + (stp >= avg ? '+' : '−') + fmtMoney(Math.abs((stp - avg) * qty)) + '</span>';
+    }
+    return '<span class="' + cls + '">損益 ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>' + amt + hit +
       '<span class="hnote">買値 ' + fmtMoney(avg) + ' → 現値 ' + fmtMoney(price) + '</span>' + dist;
+  }
+  /* 保有の損益行とサマリーを、カードに表示中の現値から描き直す（価格更新・円/ドル切替の両方で呼ぶ） */
+  function renderHolds() {
+    var rows = [];
+    document.querySelectorAll('[data-hold-c]').forEach(function (el) {
+      var cardEl = el.closest('.card'), pe = cardEl && cardEl.querySelector('.price[data-usd]');
+      var price = pe ? parseFloat(pe.getAttribute('data-usd')) : 0; if (!(price > 0)) return;
+      var avg = parseFloat(el.getAttribute('data-avg')) || 0, tgt = parseFloat(el.getAttribute('data-tgt')) || 0,
+        stp = parseFloat(el.getAttribute('data-stp')) || 0, qty = parseFloat(el.getAttribute('data-qty')) || 0;
+      el.innerHTML = holdPl(price, avg, tgt, stp, qty); rows.push([avg, price, qty, stp]);
+    });
+    var box = document.getElementById('holdsum'); if (!box || !rows.length) return;
+    var real = rows.every(function (r) { return r[2] > 0; }), tot = 0, win = 0, risk = 0;
+    rows.forEach(function (r) { tot += (r[1] - r[0]) * (real ? r[2] : 1); if (r[1] >= r[0]) win++; if (real && r[3]) risk += Math.max(0, (r[0] - r[3]) * r[2]); });
+    var R = rateNow();
+    box.innerHTML = '💼 合計評価損益 <b class="' + (tot >= 0 ? 'up' : 'dn') + '">' + (tot >= 0 ? '+' : '−') + fmtMoney(Math.abs(tot)) + '</b>' +
+      (jpyOn() ? '' : '（¥換算 ' + yen(tot * R) + '）') + '／ 含み益' + win + '銘柄・含み損' + (rows.length - win) + '銘柄' +
+      (real ? '' : '<span class="hold-sum-note">（1株あたり合算・holdings.txt に「10株」と書くと実額表示）</span>') +
+      (risk > 0 ? '<div class="hold-risk">損切りが全部当たった時の損失 <b>−' + fmtMoney(risk) + '</b>' + (jpyOn() ? '' : '（' + yen(risk * R) + '）') + '</div>' : '');
   }
   function applyPrices(map) {
     /* 損益の行も現値に追従させる（以前は生成時の株価のままで、上の現値と食い違っていた） */
-    document.querySelectorAll('[data-hold-c]').forEach(function (el) {
-      var c = el.getAttribute('data-hold-c'); if (map[c] == null) return;
-      el.innerHTML = holdPl(Number(map[c]), parseFloat(el.getAttribute('data-avg')) || 0,
-        parseFloat(el.getAttribute('data-tgt')) || 0, parseFloat(el.getAttribute('data-stp')) || 0);
-    });
     document.querySelectorAll('[data-px]').forEach(function (el) {
       var c = el.getAttribute('data-px'); if (map[c] != null) { el.setAttribute('data-usd', map[c]); el.textContent = fmtMoney(map[c]); }
     });
+    renderHolds();
     document.querySelectorAll('.ez[data-ez-c]').forEach(function (el) {
       var c = el.getAttribute('data-ez-c'), limit = parseFloat(el.getAttribute('data-ez-limit'));
       if (map[c] == null || !limit) return; var pr = Number(map[c]);
@@ -232,7 +253,7 @@
         if (d.px) applyPrices(d.px);
         if (d.idx) applyIndices(d.idx);
         var lab = document.getElementById('pxasof'); if (lab && d.asof) lab.textContent = '株価 ' + d.asof + ' 時点（約15分遅延）';
-        setMktStatus(); if (q && q.value.trim()) run(); renderWatch(); renderSizing();
+        setMktStatus(); if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderHolds();   /* 為替更新後に円換算をやり直す */
       })
       .catch(function (e) { console.warn('[globe] prices取得失敗', e); });
   }
@@ -277,7 +298,7 @@
       if (n < 1) out.push('<div class="sz warn">📐 1株でも許容損失（' + yen(riskYen) + '）を超えます → 見送り推奨</div>');
       else out.push('<div class="sz">📐 推奨 <b>' + n + '株</b>（約' + yen(n * px * R) + '・資金の' + Math.round(n * px * R / r.cap * 100) + '%）' +
         '<span class="szn">損切り時 −' + yen(n * perShare * R) + (byCap < byRisk ? '・1銘柄25%上限' : '') + '</span></div>');
-    } else out.push('<div class="sz mute">📐 「取引コーチ」で運用資金を入れると推奨株数を表示します</div>');
+    }   /* 資金が未設定のときは全カードに同じ案内を出さない（案内は取引コーチ欄に1回だけ） */
     if (gain > 0 && gain < MIN_EDGE) out.push('<div class="sz warn">⚠ 利確幅 +' + gain.toFixed(1) + '% は特定口座の往復手数料（約1%）で半分以上消えます</div>');
     else if (gain > 0) out.push('<div class="sz mute">手数料込み（特定）：利確 +' + (gain - FEE_RT * 100).toFixed(1) + '% ／ 損切 −' + (loss + FEE_RT * 100).toFixed(1) + '%</div>');
     return out.join('');
@@ -526,7 +547,7 @@
   }
 
   function init() {
-    renderCoach(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
+    renderCoach(); renderHolds(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
     tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }

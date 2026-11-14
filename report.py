@@ -63,8 +63,8 @@ HOLDINGS_FILE = Path("holdings.txt")
 
 
 def load_holdings() -> list[dict]:
-    """holdings.txt を読む。1行 = 「ティッカー,買値[,利確,損切]」。#はコメント。
-    例: SOFI,18.68  /  AAPL,180,210,165"""
+    """holdings.txt を読む。1行 = 「ティッカー,買値[,利確,損切][,株数株]」。#はコメント。
+    例: SOFI,18.68  /  AAPL,180,210,165  /  GOOGL,292.85,10株（株数は「株」を付けて任意の位置）"""
     out: list[dict] = []
     if not HOLDINGS_FILE.exists():
         return out
@@ -74,10 +74,16 @@ def load_holdings() -> list[dict]:
             if not s or s.startswith("#"):
                 continue
             parts = [p.strip() for p in s.replace("\t", ",").split(",") if p.strip() != ""]
+            qty = None
+            for q in [p for p in parts[1:] if re.fullmatch(r"\d+(?:\.\d+)?\s*株", p)]:
+                qty = float(q.rstrip("株").strip())
+                parts.remove(q)
             if len(parts) < 2:
                 continue
             try:
                 rec = {"code": _norm_ticker(parts[0]), "avg": float(parts[1])}
+                if qty and qty > 0:
+                    rec["qty"] = qty
                 if len(parts) >= 3:
                     rec["tgt"] = float(parts[2])
                 if len(parts) >= 4:
@@ -2188,11 +2194,14 @@ background:linear-gradient(140deg,rgba(240,207,115,.28),rgba(255,255,255,.02) 40
 .pl.up,.pl .up{color:var(--up)}.pl.dn,.pl .dn{color:var(--dn)}
 .pl .hit{margin-left:8px;font-size:12px}
 .hnote{font-size:11px;color:var(--mut);margin-left:8px;font-weight:600}
+.pl .hnote,.pl .amt{display:inline-block;white-space:nowrap}
 .hbasis{display:block;margin:6px 2px 0;font-weight:600}
 .hold-sum{margin:0 0 12px;padding:14px 16px;border:1px solid rgba(240,207,115,.22);border-radius:var(--r);
 background:linear-gradient(135deg,rgba(240,207,115,.10),rgba(20,30,58,.6));font-size:13px;color:var(--fg);box-shadow:var(--shadow)}
 .hold-sum b{font-size:16px}.hold-sum b.up{color:var(--up)}.hold-sum b.dn{color:var(--dn)}
 .hold-sum-note{color:var(--mut);font-size:10.5px;margin-left:6px}
+.hold-risk{margin-top:6px;font-size:12px;color:var(--mut)}.hold-risk b{color:var(--dn);font-size:13px}
+.pl .amt{margin-left:8px;font-size:14px}.pl .amt small{font-size:10.5px;color:var(--mut);font-weight:700;margin-left:2px}
 .ez{margin-top:10px;font-size:12.5px;font-weight:800;color:var(--fg);background:rgba(255,255,255,.035);border:1px solid var(--line);border-radius:12px;padding:8px 12px}
 .ez.hit{background:rgba(61,220,132,.12);border-color:rgba(61,220,132,.5)}
 .ez.hit b{color:var(--buy)}
@@ -2421,7 +2430,7 @@ APP_JS = r"""
   /* ---- USD⇄JPY トグル ---- */
   function reformatMoney() {
     document.querySelectorAll('[data-usd]').forEach(function (el) { el.textContent = fmtMoney(el.getAttribute('data-usd')); });
-    if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderTrades();
+    if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderTrades(); renderHolds();
   }
   function addJpyBtn() {
     var meta = document.querySelector('header .meta'); if (!meta || document.getElementById('jpybtn')) return;
@@ -2433,25 +2442,46 @@ APP_JS = r"""
 
   /* ---- ライブ価格 ---- */
   /* 保有カードの損益と利確・損切の到達状況（サーバ側 _hold_pl_html と同じ表示） */
-  function holdPl(price, avg, tgt, stp) {
+  function holdPl(price, avg, tgt, stp, qty) {
     var pct = avg ? Math.round((price - avg) / avg * 1000) / 10 : 0, cls = pct >= 0 ? 'up' : 'dn', hit = '';
     if (stp && price <= stp) hit = '<b class="hit dn">⚠ 損切ライン到達</b>';
     else if (tgt && price >= tgt) hit = '<b class="hit up">✅ 利確ライン到達</b>';
     var dist = (!hit && price > 0 && tgt && stp) ? '<span class="hnote">利確まで +' + ((tgt - price) / price * 100).toFixed(1) +
       '% ／ 損切まで -' + ((price - stp) / price * 100).toFixed(1) + '%</span>' : '';
-    return '<span class="' + cls + '">損益 ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>' + hit +
+    var amt = '';
+    if (qty > 0 && avg) {
+      var v = (price - avg) * qty;
+      amt = '<span class="amt ' + (v >= 0 ? 'up' : 'dn') + '">' + (v >= 0 ? '+' : '−') + fmtMoney(Math.abs(v)) + '<small>（' + qty + '株）</small></span>';
+      if (stp) amt += '<span class="hnote">損切りなら ' + (stp >= avg ? '+' : '−') + fmtMoney(Math.abs((stp - avg) * qty)) + '</span>';
+    }
+    return '<span class="' + cls + '">損益 ' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%</span>' + amt + hit +
       '<span class="hnote">買値 ' + fmtMoney(avg) + ' → 現値 ' + fmtMoney(price) + '</span>' + dist;
+  }
+  /* 保有の損益行とサマリーを、カードに表示中の現値から描き直す（価格更新・円/ドル切替の両方で呼ぶ） */
+  function renderHolds() {
+    var rows = [];
+    document.querySelectorAll('[data-hold-c]').forEach(function (el) {
+      var cardEl = el.closest('.card'), pe = cardEl && cardEl.querySelector('.price[data-usd]');
+      var price = pe ? parseFloat(pe.getAttribute('data-usd')) : 0; if (!(price > 0)) return;
+      var avg = parseFloat(el.getAttribute('data-avg')) || 0, tgt = parseFloat(el.getAttribute('data-tgt')) || 0,
+        stp = parseFloat(el.getAttribute('data-stp')) || 0, qty = parseFloat(el.getAttribute('data-qty')) || 0;
+      el.innerHTML = holdPl(price, avg, tgt, stp, qty); rows.push([avg, price, qty, stp]);
+    });
+    var box = document.getElementById('holdsum'); if (!box || !rows.length) return;
+    var real = rows.every(function (r) { return r[2] > 0; }), tot = 0, win = 0, risk = 0;
+    rows.forEach(function (r) { tot += (r[1] - r[0]) * (real ? r[2] : 1); if (r[1] >= r[0]) win++; if (real && r[3]) risk += Math.max(0, (r[0] - r[3]) * r[2]); });
+    var R = rateNow();
+    box.innerHTML = '💼 合計評価損益 <b class="' + (tot >= 0 ? 'up' : 'dn') + '">' + (tot >= 0 ? '+' : '−') + fmtMoney(Math.abs(tot)) + '</b>' +
+      (jpyOn() ? '' : '（¥換算 ' + yen(tot * R) + '）') + '／ 含み益' + win + '銘柄・含み損' + (rows.length - win) + '銘柄' +
+      (real ? '' : '<span class="hold-sum-note">（1株あたり合算・holdings.txt に「10株」と書くと実額表示）</span>') +
+      (risk > 0 ? '<div class="hold-risk">損切りが全部当たった時の損失 <b>−' + fmtMoney(risk) + '</b>' + (jpyOn() ? '' : '（' + yen(risk * R) + '）') + '</div>' : '');
   }
   function applyPrices(map) {
     /* 損益の行も現値に追従させる（以前は生成時の株価のままで、上の現値と食い違っていた） */
-    document.querySelectorAll('[data-hold-c]').forEach(function (el) {
-      var c = el.getAttribute('data-hold-c'); if (map[c] == null) return;
-      el.innerHTML = holdPl(Number(map[c]), parseFloat(el.getAttribute('data-avg')) || 0,
-        parseFloat(el.getAttribute('data-tgt')) || 0, parseFloat(el.getAttribute('data-stp')) || 0);
-    });
     document.querySelectorAll('[data-px]').forEach(function (el) {
       var c = el.getAttribute('data-px'); if (map[c] != null) { el.setAttribute('data-usd', map[c]); el.textContent = fmtMoney(map[c]); }
     });
+    renderHolds();
     document.querySelectorAll('.ez[data-ez-c]').forEach(function (el) {
       var c = el.getAttribute('data-ez-c'), limit = parseFloat(el.getAttribute('data-ez-limit'));
       if (map[c] == null || !limit) return; var pr = Number(map[c]);
@@ -2492,7 +2522,7 @@ APP_JS = r"""
         if (d.px) applyPrices(d.px);
         if (d.idx) applyIndices(d.idx);
         var lab = document.getElementById('pxasof'); if (lab && d.asof) lab.textContent = '株価 ' + d.asof + ' 時点（約15分遅延）';
-        setMktStatus(); if (q && q.value.trim()) run(); renderWatch(); renderSizing();
+        setMktStatus(); if (q && q.value.trim()) run(); renderWatch(); renderSizing(); renderHolds();   /* 為替更新後に円換算をやり直す */
       })
       .catch(function (e) { console.warn('[globe] prices取得失敗', e); });
   }
@@ -2786,7 +2816,7 @@ APP_JS = r"""
   }
 
   function init() {
-    renderCoach(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
+    renderCoach(); renderHolds(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
     tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }
@@ -2956,14 +2986,15 @@ def _holding_card(h: dict, amap: dict, valid=None, levels: dict | None = None) -
     a.rr = None
     basis = "手動指定" if (h.get("tgt") or h.get("stp")) else (
         f'買値基準・{lv["set"]}設定' if lv.get("set") else "買値基準")
-    pl = (f'<div class="pl" data-hold-c="{_esc(code)}" data-avg="{avg}" '
-          f'data-tgt="{a.tgt or ""}" data-stp="{a.stp or ""}">{_hold_pl_html(a.price, avg, a.tgt, a.stp)}</div>'
+    qty = h.get("qty") or 0
+    pl = (f'<div class="pl" data-hold-c="{_esc(code)}" data-avg="{avg}" data-qty="{qty or ""}" '
+          f'data-tgt="{a.tgt or ""}" data-stp="{a.stp or ""}">{_hold_pl_html(a.price, avg, a.tgt, a.stp, qty)}</div>'
           f'<div class="hnote hbasis">利確・損切は{basis}（株価が動いても変わりません）</div>')
     base = _card(0, a, True).replace('<span class="rank">0</span>', '<span class="rank">保有</span>')
     return base[:-6] + pl + "</div>"
 
 
-def _hold_pl_html(price: float, avg: float, tgt, stp) -> str:
+def _hold_pl_html(price: float, avg: float, tgt, stp, qty: float = 0) -> str:
     """損益と利確・損切ラインの到達状況（JS の holdPl と同じ表示）。"""
     pl_pct = round((price - avg) / avg * 100.0, 1) if avg else 0.0
     cls = "up" if pl_pct >= 0 else "dn"
@@ -2976,8 +3007,35 @@ def _hold_pl_html(price: float, avg: float, tgt, stp) -> str:
     if not hit and price > 0 and tgt and stp:
         dist = (f'<span class="hnote">利確まで +{(tgt - price) / price * 100:.1f}% ／ '
                 f'損切まで -{(price - stp) / price * 100:.1f}%</span>')
-    return (f'<span class="{cls}">損益 {"+" if pl_pct >= 0 else ""}{pl_pct}%</span>{hit}'
+    amt = ""
+    if qty and avg:
+        v = (price - avg) * qty
+        amt = (f'<span class="amt {"up" if v >= 0 else "dn"}">{"+" if v >= 0 else "−"}{_usd(abs(v))}'
+               f'<small>（{qty:g}株）</small></span>')
+        if stp:
+            amt += f'<span class="hnote">損切りなら {"+" if stp >= avg else "−"}{_usd(abs((stp - avg) * qty))}</span>'
+    return (f'<span class="{cls}">損益 {"+" if pl_pct >= 0 else ""}{pl_pct}%</span>{amt}{hit}'
             f'<span class="hnote">買値 {_usd(avg)} → 現値 {_usd(price)}</span>{dist}')
+
+
+def _hold_sum_html(rows: list[tuple], usdjpy: float) -> str:
+    """保有サマリー（JS の renderHolds と同じ表示）。rows = (買値, 現値, 株数, 損切)。
+    全銘柄に株数があれば実額、無ければ従来どおり1株あたりの合算。"""
+    if not rows:
+        return ""
+    real = all(q for _, _, q, _ in rows)
+    tot = sum((px - avg) * (q if real else 1) for avg, px, q, _ in rows)
+    win = sum(1 for avg, px, *_ in rows if px >= avg)
+    yen = f"¥{round(tot * usdjpy):,}" if usdjpy else "¥—"
+    note = "" if real else '<span class="hold-sum-note">（1株あたり合算・holdings.txt に「10株」と書くと実額表示）</span>'
+    risk = ""
+    if real:
+        r = sum(max(0.0, (avg - (st or avg)) * q) for avg, px, q, st in rows)
+        if r > 0:
+            risk = f'<div class="hold-risk">損切りが全部当たった時の損失 <b>−{_usd(r)}</b>（¥{round(r * usdjpy):,}）</div>' if usdjpy else ""
+    return (f'<div class="hold-sum" id="holdsum">💼 合計評価損益 '
+            f'<b class="{"up" if tot >= 0 else "dn"}">{"+" if tot >= 0 else "−"}{_usd(abs(tot))}</b>'
+            f'（¥換算 {yen}）／ 含み益{win}銘柄・含み損{len(rows) - win}銘柄{note}{risk}</div>')
 
 
 def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
@@ -3009,16 +3067,12 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
     # 機能4: 保有サマリー行（合計評価損益・¥換算・含み益/含み損 銘柄数）※USDJPYはprices.jsonと同レート
     _res = [(h, amap.get(h.get("code"))) for h in holdings]
     _rv = [(h, a) for h, a in _res if a]
-    hold_sum = ""
-    if _rv:
-        _tot = sum((a.price - (h.get("avg") or 0)) for h, a in _rv)
-        _win = sum(1 for h, a in _rv if a.price >= (h.get("avg") or 0))
-        _los = sum(1 for h, a in _rv if a.price < (h.get("avg") or 0))
-        _yen = f"¥{round(_tot * usdjpy):,}" if usdjpy else "¥—"
-        hold_sum = (f'<div class="hold-sum">💼 合計評価損益 '
-                    f'<b class="{"up" if _tot>=0 else "dn"}">{"+" if _tot>=0 else ""}{_usd(_tot)}</b>'
-                    f'（¥換算 {_yen}）／ 含み益{_win}銘柄・含み損{_los}銘柄'
-                    f'<span class="hold-sum-note">（1株あたり合算）</span></div>')
+    def _hstp(h, a):   # 保有カードと同じ損切（手動 → 買値基準の保存値 → 買値から計算 → 汎用）
+        avg = h.get("avg") or 0
+        lv = (hlevels or {}).get(h.get("code")) or _anchored_levels(avg, a) or {}
+        return h.get("stp") or lv.get("stp") or a.stp
+    hold_sum = _hold_sum_html([(h.get("avg") or 0, a.price, h.get("qty") or 0, _hstp(h, a)) for h, a in _rv],
+                              usdjpy) if _rv else ""
     hold_cards = hold_sum + "".join(_holding_card(h, amap, _valid_tk, hlevels) for h in holdings)
     hold_sec = _section("💼 保有銘柄", "MY HOLDINGS", hold_cards) if holdings else ""
     cand_sec = _candidate_section(cands, cmeta, amap)
