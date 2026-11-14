@@ -865,6 +865,9 @@ def _fetch_fundamentals(codes: list[str]) -> dict[str, dict]:
                 "book": info.get("bookValue"),
                 "sector": info.get("sector"),
                 "name": info.get("shortName") or info.get("longName"),
+                # 次回決算（UTC秒）。発表済みの間は前回の日付が残るので、表示側で未来の日付だけ使う
+                "earn": info.get("earningsTimestampStart") or info.get("earningsTimestamp"),
+                "earn_est": bool(info.get("isEarningsDateEstimate")),
             }
         except Exception as e:
             print(f"[globe] info失敗 {c}: {e}", file=sys.stderr)
@@ -919,7 +922,8 @@ def _fund_adjust(a: Analysis, f: dict) -> None:
         pass
     a.fund = {"per": per, "pbr": pbr, "roe": roe, "div": div,
               "target_mean": tm, "target_pct": tpct, "reco": f.get("reco"),
-              "fair": fair, "fair_gap": fair_gap, "valuation": valuation}
+              "fair": fair, "fair_gap": fair_gap, "valuation": valuation,
+              "earn": f.get("earn"), "earn_est": f.get("earn_est")}
 
 
 def _extract_quotes(res) -> list:
@@ -1250,6 +1254,8 @@ def _info_one(yf, code: str) -> dict | None:
             "sector": info.get("sector") or "",
             "rev_g": info.get("revenueGrowth"),
             "eps_g": info.get("earningsQuarterlyGrowth"),
+            "earn": info.get("earningsTimestampStart") or info.get("earningsTimestamp"),
+            "earn_est": bool(info.get("isEarningsDateEstimate")),
             "name": info.get("shortName") or info.get("longName") or ""}
 
 
@@ -1384,6 +1390,7 @@ def _select_growth(cands: list[str], feats: dict[str, dict], conf: dict[str, dic
             f["sector"] = d["sector"]
             f["rev_g"] = None if d["rev_g"] is None else round(d["rev_g"] * 100.0, 0)
             f["name"] = d["name"]
+            f["earn"], f["earn_est"] = d.get("earn"), d.get("earn_est")
     return sorted(keep, key=lambda c: (-feats[c]["score"], c))
 
 
@@ -1747,8 +1754,38 @@ def _card(rank: int, a: Analysis, show_levels: bool) -> str:
         f'<span class="name">{_esc(a.name)}</span>{seg_html}</div>{_badge(a.g)}</div>'
         f'<div class="row2"><span class="price" data-px="{_esc(a.code)}" data-usd="{a.price}">{_usd(a.price)}</span>'
         f'<span class="score {scls}">{"+" if a.sc>=0 else ""}{a.sc}</span>{_score_bar(a.sc)}</div>'
-        f'{levels}{an}{fair}{ez_html}{fund}{bt}{reasons}</div>'
+        f'{levels}{_earn_html(a.fund.get("earn"), a.fund.get("earn_est")) if a.fund else ""}'
+        f'{an}{fair}{ez_html}{fund}{bt}{reasons}</div>'
     )
+
+
+EARN_SOON_DAYS = 14    # この日数以内の決算は警告（新規買い・持ち越しの判断材料）
+EARN_SHOW_DAYS = 60    # これより先の決算は表示しない
+
+
+EARN_NOTE = {False: "発表で損切りを飛び越えて下がることあり。新規買いは発表後に",
+             True: "発表で損切りを飛び越えて下がることあり。持ち越すか（一部利確するか）を事前に決める"}
+
+
+def _earn_html(ts, est=False, now: datetime | None = None, held: bool = False) -> str:
+    """次回決算の表示（JS の earnHtml と同じ）。過去の日付・遠すぎる日付は出さない。
+    決算発表では株価が窓を開けて動き、損切ラインを飛び越えて約定することがある。"""
+    try:
+        ts = float(ts)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    d = datetime.fromtimestamp(ts, tz=ET).date()
+    days = (d - (now or _et_now()).date()).days
+    if days < 0 or days > EARN_SHOW_DAYS:
+        return ""
+    when = "今日" if days == 0 else f"あと{days}日"
+    lab = f'📅 決算 {d.month}/{d.day}{"（予定）" if est else ""}・{when}'
+    if days <= EARN_SOON_DAYS:
+        return (f'<div class="earn soon" data-earn="{int(ts)}" data-est="{1 if est else ""}" data-held="{1 if held else ""}">{lab}'
+                f'<span class="ezn">{EARN_NOTE[bool(held)]}</span></div>')
+    return f'<div class="earn" data-earn="{int(ts)}" data-est="{1 if est else ""}" data-held="{1 if held else ""}">{lab}</div>'
 
 
 def _keyed(section_html: str, key: str, label: str) -> str:
@@ -1838,7 +1875,7 @@ def _growth_card(rank: int, a: Analysis) -> str:
         f'<span class="price" data-px="{_esc(a.code)}" data-usd="{a.price}">{_usd(a.price)}</span>'
         f'<span class="gscore">爆発力 {gsc:.0f}</span>'
         f'<span class="bar"><span class="bar-g" style="width:{_clip(gsc, 0.0, 100.0):.0f}%"></span></span>'
-        f'</div>{chips_html}{warn}</div>'
+        f'</div>{chips_html}{warn}{_earn_html(gr.get("earn"), gr.get("earn_est"))}</div>'
     )
 
 
@@ -2204,6 +2241,9 @@ background:linear-gradient(135deg,rgba(240,207,115,.10),rgba(20,30,58,.6));font-
 .pl .amt{margin-left:8px;font-size:14px}.pl .amt small{font-size:10.5px;color:var(--mut);font-weight:700;margin-left:2px}
 .ez{margin-top:10px;font-size:12.5px;font-weight:800;color:var(--fg);background:rgba(255,255,255,.035);border:1px solid var(--line);border-radius:12px;padding:8px 12px}
 .ez.hit{background:rgba(61,220,132,.12);border-color:rgba(61,220,132,.5)}
+.earn{margin-top:10px;font-size:12px;font-weight:700;color:var(--mut)}
+.earn.soon{font-size:12.5px;font-weight:800;color:#ffd38a;background:rgba(255,190,90,.08);border:1px solid rgba(255,190,90,.35);border-radius:12px;padding:8px 12px}
+.earn.soon .ezn{display:block;margin:2px 0 0;color:var(--mut)}
 .ez.hit b{color:var(--buy)}
 .ezn{margin-left:8px;font-size:11px;font-weight:700;color:var(--mut)}
 .fund,.bt,.reasons{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
@@ -2318,6 +2358,26 @@ APP_JS = r"""
   function bar(sc) { var p = Math.max(-100, Math.min(100, sc)) / 100; if (p >= 0) return '<span class="bar"><span class="bar-pos" style="width:' + (p * 50) + '%"></span></span>'; return '<span class="bar"><span class="bar-neg" style="width:' + (Math.abs(p) * 50) + '%;margin-left:' + (50 - Math.abs(p) * 50) + '%"></span></span>'; }
   function starBtn(c) { var on = inWatch(c); return '<button class="star' + (on ? ' on' : '') + '" data-star="' + esc(c) + '">' + (on ? '★' : '☆') + '</button>'; }
 
+  /* 次回決算（Python の _earn_html と同じ表示）。日数は開いた時点で数え直す */
+  function etDate(ms) { try { var p = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'numeric', day: 'numeric' }).formatToParts(new Date(ms)), o = {}; p.forEach(function (x) { o[x.type] = +x.value; }); return o; } catch (e) { var d = new Date(ms - 5 * 3600000); return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() }; } }
+  function earnHtml(ts, est, held) {
+    ts = Number(ts); if (!(ts > 0)) return '';
+    var e = etDate(ts * 1000), n = etDate(Date.now());
+    var days = Math.round((Date.UTC(e.year, e.month - 1, e.day) - Date.UTC(n.year, n.month - 1, n.day)) / 86400000);
+    if (days < 0 || days > 60) return '';
+    var lab = '📅 決算 ' + e.month + '/' + e.day + (est ? '（予定）' : '') + '・' + (days === 0 ? '今日' : 'あと' + days + '日');
+    var attrs = ' data-earn="' + ts + '" data-est="' + (est ? 1 : '') + '" data-held="' + (held ? 1 : '') + '"';
+    if (days <= 14) return '<div class="earn soon"' + attrs + '>' + lab + '<span class="ezn">' +
+      (held ? '発表で損切りを飛び越えて下がることあり。持ち越すか（一部利確するか）を事前に決める' : '発表で損切りを飛び越えて下がることあり。新規買いは発表後に') + '</span></div>';
+    return '<div class="earn"' + attrs + '>' + lab + '</div>';
+  }
+  function refreshEarn() {
+    document.querySelectorAll('.earn[data-earn]').forEach(function (el) {
+      var h = earnHtml(el.getAttribute('data-earn'), el.getAttribute('data-est'), el.getAttribute('data-held'));
+      if (!h) { el.parentNode.removeChild(el); return; }
+      var t = document.createElement('div'); t.innerHTML = h; el.parentNode.replaceChild(t.firstChild, el);
+    });
+  }
   function card(s, mode) {
     var scls = s.sc >= 0 ? 'pos' : 'neg';
     var seg = s.m ? '<span class="seg">' + esc(s.m) + '</span>' : '';
@@ -2337,7 +2397,7 @@ APP_JS = r"""
       badge(s.g) + starBtn(s.c) + rm + '</div>' +
       '<div class="row2"><span class="price" data-px="' + c + '" data-usd="' + esc(s.p) + '">' + fmtMoney(s.p) + '</span>' +
       '<span class="score ' + scls + '">' + (s.sc >= 0 ? '+' : '') + s.sc + '</span>' + bar(s.sc) + '</div>' +
-      levels + an + fair + reasons +
+      levels + (s.e ? earnHtml(s.e, s.ee) : '') + an + fair + reasons +
       '<div class="reasons"><span class="chip">スコア順 ' + (s.rk || '-') + ' 位 / ' + TOTAL + ' 銘柄</span></div></div>';
   }
   /* 検索キー（社名＋ティッカー）はクライアントで生成してキャッシュ（stocks.json を軽くするため） */
@@ -2712,7 +2772,8 @@ APP_JS = r"""
       '<li><b>損切りは買う前に決める</b> — 損切ライン到達で即売り。−8%を超えて持たない</li>' +
       '<li><b>特定口座は利確幅 +2% 以上だけ</b> — 往復手数料が約1%かかる</li>' +
       '<li><b>NISAは長期保有用</b> — 短期売買は枠を消費し、損失も通算できない</li>' +
-      '<li><b>1銘柄は資金の25%まで</b>・<b>当日の往復売買はしない</b></li></ol>' +
+      '<li><b>1銘柄は資金の25%まで</b>・<b>当日の往復売買はしない</b></li>' +
+      '<li><b>決算2週間前からは新規で買わない</b> — 発表で損切りを飛び越えて下がることがある（カードの📅）</li></ol>' +
       '<div class="cimp"><label class="cbtn">📥 SBIの約定履歴CSVを読み込む<input id="trfile" type="file"></label>' +
       '<button type="button" id="trclr" class="cbtn ghost">消去</button></div>' +
       '<p class="cnote">CSVはこの端末の中だけで処理・保存され、どこにも送信されません。</p><div id="trstats"></div>';
@@ -2816,7 +2877,7 @@ APP_JS = r"""
   }
 
   function init() {
-    renderCoach(); renderHolds(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
+    renderCoach(); renderHolds(); refreshEarn(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
     tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }
@@ -2907,6 +2968,8 @@ def _to_stock_json(a: Analysis, rank: int) -> dict:
         "p": a.price, "sc": a.sc, "g": a.g, "m": _sector_short(a.sector),
         "t": a.tgt, "st": a.stp, "rr": a.rr, "r": a.reasons, "tp": tp,
         "val": val, "fg": fg, "rk": rank,
+        **({"e": int(a.fund["earn"]), "ee": 1 if a.fund.get("earn_est") else 0}
+           if a.fund and a.fund.get("earn") else {}),
     }
 
 
@@ -2991,6 +3054,9 @@ def _holding_card(h: dict, amap: dict, valid=None, levels: dict | None = None) -
           f'data-tgt="{a.tgt or ""}" data-stp="{a.stp or ""}">{_hold_pl_html(a.price, avg, a.tgt, a.stp, qty)}</div>'
           f'<div class="hnote hbasis">利確・損切は{basis}（株価が動いても変わりません）</div>')
     base = _card(0, a, True).replace('<span class="rank">0</span>', '<span class="rank">保有</span>')
+    if a.fund and a.fund.get("earn"):
+        base = base.replace(_earn_html(a.fund["earn"], a.fund.get("earn_est")),
+                            _earn_html(a.fund["earn"], a.fund.get("earn_est"), held=True))
     return base[:-6] + pl + "</div>"
 
 

@@ -49,6 +49,26 @@
   function bar(sc) { var p = Math.max(-100, Math.min(100, sc)) / 100; if (p >= 0) return '<span class="bar"><span class="bar-pos" style="width:' + (p * 50) + '%"></span></span>'; return '<span class="bar"><span class="bar-neg" style="width:' + (Math.abs(p) * 50) + '%;margin-left:' + (50 - Math.abs(p) * 50) + '%"></span></span>'; }
   function starBtn(c) { var on = inWatch(c); return '<button class="star' + (on ? ' on' : '') + '" data-star="' + esc(c) + '">' + (on ? '★' : '☆') + '</button>'; }
 
+  /* 次回決算（Python の _earn_html と同じ表示）。日数は開いた時点で数え直す */
+  function etDate(ms) { try { var p = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', year: 'numeric', month: 'numeric', day: 'numeric' }).formatToParts(new Date(ms)), o = {}; p.forEach(function (x) { o[x.type] = +x.value; }); return o; } catch (e) { var d = new Date(ms - 5 * 3600000); return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() }; } }
+  function earnHtml(ts, est, held) {
+    ts = Number(ts); if (!(ts > 0)) return '';
+    var e = etDate(ts * 1000), n = etDate(Date.now());
+    var days = Math.round((Date.UTC(e.year, e.month - 1, e.day) - Date.UTC(n.year, n.month - 1, n.day)) / 86400000);
+    if (days < 0 || days > 60) return '';
+    var lab = '📅 決算 ' + e.month + '/' + e.day + (est ? '（予定）' : '') + '・' + (days === 0 ? '今日' : 'あと' + days + '日');
+    var attrs = ' data-earn="' + ts + '" data-est="' + (est ? 1 : '') + '" data-held="' + (held ? 1 : '') + '"';
+    if (days <= 14) return '<div class="earn soon"' + attrs + '>' + lab + '<span class="ezn">' +
+      (held ? '発表で損切りを飛び越えて下がることあり。持ち越すか（一部利確するか）を事前に決める' : '発表で損切りを飛び越えて下がることあり。新規買いは発表後に') + '</span></div>';
+    return '<div class="earn"' + attrs + '>' + lab + '</div>';
+  }
+  function refreshEarn() {
+    document.querySelectorAll('.earn[data-earn]').forEach(function (el) {
+      var h = earnHtml(el.getAttribute('data-earn'), el.getAttribute('data-est'), el.getAttribute('data-held'));
+      if (!h) { el.parentNode.removeChild(el); return; }
+      var t = document.createElement('div'); t.innerHTML = h; el.parentNode.replaceChild(t.firstChild, el);
+    });
+  }
   function card(s, mode) {
     var scls = s.sc >= 0 ? 'pos' : 'neg';
     var seg = s.m ? '<span class="seg">' + esc(s.m) + '</span>' : '';
@@ -68,7 +88,7 @@
       badge(s.g) + starBtn(s.c) + rm + '</div>' +
       '<div class="row2"><span class="price" data-px="' + c + '" data-usd="' + esc(s.p) + '">' + fmtMoney(s.p) + '</span>' +
       '<span class="score ' + scls + '">' + (s.sc >= 0 ? '+' : '') + s.sc + '</span>' + bar(s.sc) + '</div>' +
-      levels + an + fair + reasons +
+      levels + (s.e ? earnHtml(s.e, s.ee) : '') + an + fair + reasons +
       '<div class="reasons"><span class="chip">スコア順 ' + (s.rk || '-') + ' 位 / ' + TOTAL + ' 銘柄</span></div></div>';
   }
   /* 検索キー（社名＋ティッカー）はクライアントで生成してキャッシュ（stocks.json を軽くするため） */
@@ -443,7 +463,8 @@
       '<li><b>損切りは買う前に決める</b> — 損切ライン到達で即売り。−8%を超えて持たない</li>' +
       '<li><b>特定口座は利確幅 +2% 以上だけ</b> — 往復手数料が約1%かかる</li>' +
       '<li><b>NISAは長期保有用</b> — 短期売買は枠を消費し、損失も通算できない</li>' +
-      '<li><b>1銘柄は資金の25%まで</b>・<b>当日の往復売買はしない</b></li></ol>' +
+      '<li><b>1銘柄は資金の25%まで</b>・<b>当日の往復売買はしない</b></li>' +
+      '<li><b>決算2週間前からは新規で買わない</b> — 発表で損切りを飛び越えて下がることがある（カードの📅）</li></ol>' +
       '<div class="cimp"><label class="cbtn">📥 SBIの約定履歴CSVを読み込む<input id="trfile" type="file"></label>' +
       '<button type="button" id="trclr" class="cbtn ghost">消去</button></div>' +
       '<p class="cnote">CSVはこの端末の中だけで処理・保存され、どこにも送信されません。</p><div id="trstats"></div>';
@@ -547,7 +568,7 @@
   }
 
   function init() {
-    renderCoach(); renderHolds(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
+    renderCoach(); renderHolds(); refreshEarn(); initFold(); addRefreshBtn(); addJpyBtn(); injectStars(); setMktStatus(); markMaWatch(); renderSizing();
     if (getWatch().length) ensureStocks(renderWatch); else ensureWatchSec();
     tick();   /* tick が即座に refreshPrices を呼ぶ（以前は二重に取得していた） */
   }
