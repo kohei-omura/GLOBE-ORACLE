@@ -2886,6 +2886,254 @@ APP_JS = r"""
 """
 
 
+# 日米連動パネル（株オラクル ⇄ GLOBE ORACLE 共通。両リポジトリに同じものを置く）
+XLINK_CSS = r"""
+/* ── 日米連動パネル（両アプリ共通。各アプリの色変数をそのまま使う） ── */
+.xapp{display:inline-flex;align-items:center;gap:4px;margin-top:10px;padding:6px 12px;border-radius:999px;font-size:12px;font-weight:700;
+  color:var(--gold);border:1px solid var(--line2);background:rgba(255,255,255,.04);text-decoration:none;-webkit-tap-highlight-color:transparent}
+.xapp:active{transform:scale(.97)}
+.xl{display:flex;flex-direction:column;gap:10px;color:var(--fg)}
+.xl-up{color:var(--buy)!important}.xl-dn{color:var(--sell)!important}
+.xl-mut{margin:0;font-size:12px;color:var(--mut)}
+.xl-verdict{border:1px solid var(--line2);border-radius:16px;padding:12px 14px;background:var(--card)}
+.xl-verdict.lv4,.xl-verdict.lv3{border-color:rgba(76,208,125,.45);background:linear-gradient(135deg,rgba(76,208,125,.13),var(--card) 70%)}
+.xl-verdict.lv0,.xl-verdict.lv1{border-color:rgba(255,107,134,.45);background:linear-gradient(135deg,rgba(255,107,134,.13),var(--card) 70%)}
+.xl-vh{display:flex;align-items:center;gap:10px}
+.xl-ic{font-size:28px;line-height:1}
+.xl-vt{flex:1;min-width:0;display:flex;flex-direction:column}
+.xl-vt small{font-size:10.5px;color:var(--mut);letter-spacing:.02em}
+.xl-vt b{font-size:19px;font-weight:800;letter-spacing:.02em}
+.xl-gauge{display:flex;gap:3px}
+.xl-gauge span{width:9px;height:18px;border-radius:3px;background:rgba(255,255,255,.08)}
+.xl-gauge span.on.neg{background:var(--sell)}.xl-gauge span.on.pos{background:var(--buy)}.xl-gauge span.on.mid{background:var(--gold)}
+.xl-desc{margin:8px 0 0;font-size:13px;line-height:1.6}
+.xl-ax{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:8px;font-size:12px;color:var(--mut)}
+.xl-ax b{color:var(--fg);font-variant-numeric:tabular-nums}
+.xl-notes{margin:8px 0 0;padding-left:18px;font-size:12px;line-height:1.6;color:var(--fg)}
+.xl-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+.xl-i{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:8px 10px;min-width:0}
+.xl-n{font-size:10px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.xl-v{font-size:14px;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.xl-c{font-size:11.5px;font-weight:700;color:var(--mut);font-variant-numeric:tabular-nums}
+.xl-meta{margin:0;font-size:11.5px;color:var(--mut);line-height:1.6}
+.xl-sep{opacity:.5;margin:0 4px}
+.xl-h3{margin:6px 0 0;font-size:14px;font-weight:800}
+.xl-sum{font-size:12px;color:var(--mut);line-height:1.7}
+.xl-sum b{font-variant-numeric:tabular-nums}
+.xl-hl{display:flex;flex-direction:column;gap:6px}
+.xl-h{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;grid-template-areas:"mk n p st" "mk n d d";align-items:center;gap:2px 8px;
+  background:var(--card);border:1px solid var(--line);border-radius:12px;padding:8px 10px}
+.xl-mk{grid-area:mk;font-size:11px;font-weight:800;width:22px;height:22px;border-radius:7px;display:grid;place-items:center}
+.xl-mk.jp{background:rgba(255,107,134,.16);color:#ff9fb1}.xl-mk.us{background:rgba(111,168,255,.16);color:#9cc2ff}
+.xl-hn{grid-area:n;min-width:0;display:flex;flex-direction:column}
+.xl-hn b{font-size:13px}.xl-hn small{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.xl-hp{grid-area:p;text-align:right;font-size:13px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.xl-hp small{margin-left:6px;font-size:12px}
+.xl-hd{grid-area:d;display:flex;justify-content:flex-end;gap:10px;font-size:10.5px;color:var(--mut);font-variant-numeric:tabular-nums;white-space:nowrap}
+.xl-st{grid-area:st;font-size:10.5px;font-weight:800;padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.07);color:var(--mut);white-space:nowrap}
+.xl-st.sell{background:rgba(255,107,134,.18);color:var(--sell)}.xl-st.buy{background:rgba(76,208,125,.18);color:var(--buy)}
+.xl-st.warn{background:rgba(240,190,90,.2);color:var(--gold)}
+.xl-src{margin:2px 0 0;font-size:10.5px;color:var(--mut);line-height:1.6}
+.xl-src a{color:var(--gold);font-weight:700;text-decoration:none}
+@media (max-width:360px){.xl-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+"""
+
+XLINK_JS = r"""
+/* ── 日米連動（株オラクル ⇄ GLOBE ORACLE） ──
+   両アプリは同じ GitHub Pages（kohei-omura.github.io）に公開しているので、相手の公開JSONを読むだけで連携する。
+   端末の保存領域・トークン・既存の処理には一切触らない（読み取り専用）。
+   判定は「米国株(①指数)×為替(②ドル円)」のクイックチェックに、③米金利・④日本固有の地合いを添える。 */
+(function () {
+  'use strict';
+  var SELF = '__SELF__';
+  var box = document.getElementById('xlink');
+  if (!box || !window.fetch) return;
+  var ROOT = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? location.origin : 'https://kohei-omura.github.io';
+  var K = ROOT + '/kabu-oracle/', G = ROOT + '/GLOBE-ORACLE/';
+
+  function get(u) {
+    return fetch(u + '?t=' + Date.now()).then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; });
+  }
+  function esc(x) {
+    return String(x == null ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+  function num(v) { if (v === null || v === undefined || v === '') return null; v = Number(v); return isFinite(v) ? v : null; }
+  function sg(v, d) { return (v > 0 ? '+' : v < 0 ? '−' : '±') + Math.abs(v).toFixed(d == null ? 1 : d); }
+  function pc(v, d) { return v == null ? '—' : sg(v, d) + '%'; }
+  function ud(v) { return v == null ? '' : v > 0 ? ' xl-up' : v < 0 ? ' xl-dn' : ''; }
+  function chgOf(idx, k) { var d = idx && idx[k]; return d ? num(d.chg) : null; }
+  function pxOf(idx, k) { var d = idx && idx[k]; return d ? num(d.price) : null; }
+
+  /* 米国株の総合値（%）：S&P500 と NASDAQ を重く、ダウを軽く。取れた指数だけで平均する */
+  function usMove(idx) {
+    var w = { SP500: 0.4, NASDAQ: 0.4, DOW: 0.2 }, s = 0, t = 0;
+    for (var k in w) { var c = chgOf(idx, k); if (c != null) { s += c * w[k]; t += w[k]; } }
+    return t ? s / t : null;
+  }
+  var US_TH = 0.3, FX_TH = 0.2, FX_SHARP = 0.8, SOX_TH = 1.5;
+
+  /* クイックチェック（むらちゃんの判断軸まとめ「3. 投資判断のクイックチェック」をそのまま実装） */
+  function judge(idx, rg) {
+    var us = usMove(idx), fx = chgOf(idx, 'USDJPY');
+    if (us == null) return null;
+    var u = us >= US_TH ? 1 : us <= -US_TH ? -1 : 0;
+    var f = fx == null ? 0 : fx >= FX_TH ? 1 : fx <= -FX_TH ? -1 : 0;   /* +1 = 円安, −1 = 円高 */
+    var sharp = fx != null && fx <= -FX_SHARP;
+    var r;
+    if (u > 0 && f > 0) r = [2, '強気', '☀', '米国株高＋円安：日本株にとって最強の上昇要因。特に輸出・ハイテク株に追い風'];
+    else if (u > 0 && f < 0) r = sharp
+      ? [0, '上がりにくい', '🌤', '米国株高でも急な円高：輸出企業の業績悪化が意識され、日本株は上がりにくい（連動が弱まる）']
+      : [0, '方向感に迷う', '🌤', '米国株高＋円高：方向感に迷いやすい。輸出株より内需株が相対的に優位'];
+    else if (u > 0) r = [1, 'やや強気', '🌤', '米国株高：翌朝の日本株は買い先行（ギャップアップ）で始まりやすい'];
+    else if (u < 0 && f < 0) r = [-2, '弱気・リスクオフ', '☔', '米国株安＋円高：リスクオフ。全面安に警戒（新規買いは慎重に）'];
+    else if (u < 0 && f > 0) r = [-1, '下落は限定的', '☁', '米国株安＋円安：円安が下支えとなり、日本株の下落は限定的になりやすい'];
+    else if (u < 0) r = [-1, 'やや弱気', '☁', '米国株安：翌朝の日本株は売り先行で始まりやすい'];
+    else if (f > 0) r = [1, '小動き・円安', '⛅', '米国は小動き。円安が輸出株の支えになりやすい'];
+    else if (f < 0) r = [-1, '小動き・円高', '⛅', '米国は小動き。円高が輸出株の重荷になりやすい'];
+    else r = [0, '中立', '⛅', '米国・為替とも小動き。日本固有の材料（決算・自社株買い等）で動きやすい'];
+    var o = { lv: r[0], label: r[1], icon: r[2], desc: r[3], us: us, fx: fx, u: u, f: f, notes: [] };
+
+    /* ① 半導体（SOX）は日本の関連銘柄に直結 */
+    var sox = chgOf(idx, 'SOX');
+    if (sox != null && sox >= SOX_TH) o.notes.push('半導体指数SOXが' + pc(sox) + '：日本の半導体関連（東京エレクトロン・アドバンテスト等）に追い風');
+    else if (sox != null && sox <= -SOX_TH) o.notes.push('半導体指数SOXが' + pc(sox) + '：日本の半導体関連に逆風');
+    /* ③ 金利差：米金利の上げ下げは日米金利差→ドル円を通じて効く */
+    var tn = pxOf(idx, 'US10Y'), tc = chgOf(idx, 'US10Y');
+    if (tn != null && tc != null) {
+      var bp = tn - tn / (1 + tc / 100);              /* 前日比（%ポイント） */
+      if (bp >= 0.05) o.notes.push('米10年金利が上昇（' + tn.toFixed(2) + '%）：日米金利差の拡大は円安・日本株高の方向');
+      else if (bp <= -0.05) o.notes.push('米10年金利が低下（' + tn.toFixed(2) + '%）：金利差の縮小は円高・日本株の重荷の方向');
+    }
+    /* ④ 日本固有の地合い（デカップリング） */
+    if (rg && rg.label) {
+      if (u < 0 && rg.label === '上昇基調') o.notes.push('日経は上昇基調：米国安でも日本独自の強さ（業績・株主還元）で底堅い可能性');
+      else if (u > 0 && rg.label === '下落基調') o.notes.push('日経は下落基調：米国高でも戻り売りが出やすい。推奨株数は半分のまま');
+      else if (rg.label === '下落基調') o.notes.push('日経は下落基調：株オラクルの推奨株数は地合いに合わせて半分');
+    }
+    return o;
+  }
+
+  function idxTile(name, d, yen) {
+    var p = d ? num(d.price) : null, c = d ? num(d.chg) : null;
+    return '<div class="xl-i"><div class="xl-n">' + esc(name) + '</div><div class="xl-v">' +
+      (p == null ? '—' : (yen ? '¥' : '') + p.toLocaleString(undefined, { maximumFractionDigits: 2 })) +
+      '</div><div class="xl-c' + ud(c) + '">' + pc(c, 2) + '</div></div>';
+  }
+  function gauge(lv) {
+    var h = '';
+    for (var i = -2; i <= 2; i++) h += '<span class="' + (i === lv ? 'on ' : '') + (i < 0 ? 'neg' : i > 0 ? 'pos' : 'mid') + '"></span>';
+    return '<div class="xl-gauge" aria-hidden="true">' + h + '</div>';
+  }
+
+  /* 保有：日米どちらの画面でも同じ一覧（自分の市場も含めて1つの表にする） */
+  function rowsOf(hj, pj, mk) {
+    var out = [], px = (pj && pj.px) || {};
+    ((hj && hj.items) || []).forEach(function (h) {
+      var cur = num(px[h.c]); if (cur == null) cur = num(h.p);
+      out.push({ mk: mk, c: h.c, n: h.n || '', px: cur, buy: num(h.buy), tgt: num(h.tgt), stp: num(h.stp),
+                 qty: num(h.qty) || 0, long: !!h.long });
+    });
+    return out;
+  }
+  function money(mk, v) {
+    if (v == null) return '—';
+    return mk === 'US' ? '$' + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+                       : '¥' + Math.round(v).toLocaleString();
+  }
+  function holdTable(rows, rate) {
+    if (!rows.length) return '<p class="xl-mut">保有銘柄はありません。</p>';
+    rows.forEach(function (r) {
+      r.pl = (r.px != null && r.buy) ? (r.px / r.buy - 1) * 100 : null;
+      r.toS = (r.px && r.stp) ? (r.stp / r.px - 1) * 100 : null;
+      r.toT = (r.px && r.tgt) ? (r.tgt / r.px - 1) * 100 : null;
+      if (r.px != null && r.stp && r.px <= r.stp) { r.st = '損切圏'; r.sc = 'sell'; r.o = 0; }
+      else if (r.px != null && r.tgt && r.px >= r.tgt && !r.long) { r.st = '利確圏'; r.sc = 'buy'; r.o = 1; }
+      else if (r.toS != null && r.toS > -3) { r.st = '損切接近'; r.sc = 'warn'; r.o = 2; }
+      else { r.st = r.long ? '長期' : '保有中'; r.sc = 'hold'; r.o = 3; }
+    });
+    rows.sort(function (a, b) { return a.o - b.o || (a.pl == null) - (b.pl == null) || (a.pl || 0) - (b.pl || 0); });
+    var h = '<div class="xl-hl">';
+    rows.forEach(function (r) {
+      h += '<div class="xl-h">' +
+        '<span class="xl-mk ' + (r.mk === 'US' ? 'us' : 'jp') + '">' + (r.mk === 'US' ? '米' : '日') + '</span>' +
+        '<span class="xl-hn"><b>' + esc(r.c) + '</b><small>' + esc(r.n) + '</small></span>' +
+        '<span class="xl-hp">' + money(r.mk, r.px) + '<small class="' + ud(r.pl).trim() + '">' + pc(r.pl) + '</small></span>' +
+        '<span class="xl-hd"><small>損切まで ' + (r.toS == null ? '—' : pc(r.toS)) + '</small><small>' +
+        (r.long ? '利確通知OFF' : '利確まで ' + (r.toT == null ? '—' : pc(r.toT))) + '</small></span>' +
+        '<span class="xl-st ' + r.sc + '">' + r.st + '</span></div>';
+    });
+    h += '</div>';
+    /* 合計：株数がある銘柄だけ実額（ドルは円換算して合算） */
+    var yen = 0, have = 0, miss = 0;
+    rows.forEach(function (r) {
+      if (r.qty && r.px != null && r.buy) { yen += (r.px - r.buy) * r.qty * (r.mk === 'US' ? (rate || 0) : 1); have++; }
+      else miss++;
+    });
+    var jp = rows.filter(function (r) { return r.mk === 'JP' && r.pl != null; });
+    var us = rows.filter(function (r) { return r.mk === 'US' && r.pl != null; });
+    function avg(a) { return a.length ? a.reduce(function (s, r) { return s + r.pl; }, 0) / a.length : null; }
+    var s = [];
+    if (jp.length) s.push('🇯🇵 ' + jp.length + '銘柄 平均 <b class="' + ud(avg(jp)).trim() + '">' + pc(avg(jp)) + '</b>');
+    if (us.length) s.push('🇺🇸 ' + us.length + '銘柄 平均 <b class="' + ud(avg(us)).trim() + '">' + pc(avg(us)) + '</b>');
+    if (have && rate) s.push('株数のある' + have + '銘柄の評価損益 <b class="' + ud(yen).trim() + '">' + (yen >= 0 ? '+' : '−') + '¥' + Math.round(Math.abs(yen)).toLocaleString() + '</b>');
+    return '<div class="xl-sum">' + s.join('<span class="xl-sep">／</span>') + '</div>' + h +
+      (miss ? '<p class="xl-mut">※株数が未登録の銘柄は損益率のみ（holdings.txt に株数を書くと実額で合算）</p>' : '');
+  }
+
+  function render(gp, kd, gh, kh, kp) {
+    var idx = (gp && gp.idx) || {}, rg = kd && kd.regime, j = judge(idx, rg);
+    var rate = pxOf(idx, 'USDJPY');
+    var live = gp && gp.mkt && gp.mkt.open_ms && gp.mkt.close_ms && Date.now() >= gp.mkt.open_ms && Date.now() < gp.mkt.close_ms;
+    var h = '';
+    if (j) {
+      h += '<div class="xl-verdict lv' + (j.lv + 2) + '"><div class="xl-vh"><span class="xl-ic">' + j.icon + '</span>' +
+        '<span class="xl-vt"><small>' + (live ? '米国市場 取引中の途中経過から見た 次の東京市場' : '前夜の米国市場から見た 次の東京市場') + '</small>' +
+        '<b>日本株：' + esc(j.label) + '</b></span>' + gauge(j.lv) + '</div>' +
+        '<p class="xl-desc">' + esc(j.desc) + '</p>' +
+        '<div class="xl-ax"><span>①米国株 <b class="' + ud(j.us).trim() + '">' + pc(j.us, 2) + '</b></span>' +
+        '<span>②ドル円 <b>' + (j.fx == null ? '—' : (j.f > 0 ? '円安 ' : j.f < 0 ? '円高 ' : '横ばい ') + pc(j.fx, 2)) + '</b></span></div>' +
+        (j.notes.length ? '<ul class="xl-notes">' + j.notes.map(function (n) { return '<li>' + esc(n) + '</li>'; }).join('') + '</ul>' : '') +
+        '</div>';
+    } else {
+      h += '<p class="xl-mut">米国市場のデータを読み込めませんでした（GLOBE ORACLE の更新待ち）。</p>';
+    }
+    h += '<div class="xl-grid">' + idxTile('S&P 500', idx.SP500) + idxTile('NASDAQ', idx.NASDAQ) + idxTile('NYダウ', idx.DOW) +
+      idxTile('SOX 半導体', idx.SOX) + idxTile('ドル円', idx.USDJPY, true) +
+      (rg ? '<div class="xl-i"><div class="xl-n">日経平均</div><div class="xl-v">' + (num(rg.price) == null ? '—' : num(rg.price).toLocaleString()) +
+        '</div><div class="xl-c' + ud(num(rg.chg1)) + '">' + (num(rg.chg1) == null ? '' : '前日 ' + pc(num(rg.chg1), 2)) + '</div></div>' : '') +
+      '</div>';
+    var meta = [];
+    if (rg) meta.push('④ 日本の地合い ' + esc((rg.icon || '') + ' ' + rg.label) + '（日経20日 ' + pc(num(rg.chg20)) + '）');
+    if (pxOf(idx, 'US10Y') != null) meta.push('③ 米10年金利 ' + pxOf(idx, 'US10Y').toFixed(2) + '%');
+    if (meta.length) h += '<p class="xl-meta">' + meta.join('<span class="xl-sep">／</span>') + '</p>';
+    h += '<h3 class="xl-h3">日米の保有まとめ</h3>' +
+      holdTable(rowsOf(kh, kp, 'JP').concat(rowsOf(gh, gp, 'US')), rate);
+    var src = [];
+    if (gp && gp.asof) src.push('米国 ' + esc(gp.asof) + ' JST');
+    if (kd && kd.generated) src.push('日本 ' + esc(kd.generated));
+    h += '<p class="xl-src">' + src.join('・') + ' 時点 ／ ' +
+      (SELF === 'kabu' ? '<a href="' + G + '">🌎 GLOBE ORACLE で米国株を見る ›</a>' : '<a href="' + K + '">🇯🇵 株オラクルで日本株を見る ›</a>') +
+      '<br>判定は「米国株×ドル円」の目安です。日銀・FRBの会合や日本の決算発表がある日は、そちらが優先されることがあります。</p>';
+    box.innerHTML = h;
+    var cnt = document.getElementById('xlcnt');
+    if (cnt && j) cnt.textContent = j.icon + ' ' + j.label;
+  }
+
+  function load() {
+    return Promise.all([get(G + 'prices.json'), get(K + 'data.json'), get(G + 'holdings.json'),
+                        get(K + 'holdings.json'), get(K + 'prices.json')])
+      .then(function (a) { render(a[0], a[1], a[2], a[3], a[4]); })
+      .catch(function (e) { console.warn('[xlink] 失敗', e); });
+  }
+  load();
+  setInterval(function () { if (!document.hidden) load(); }, 10 * 60 * 1000);
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) load(); });
+})();
+"""
+
+
 # ─────────────────────────────────────────────
 #  USDJPY / 指数 / PWAアイコン
 # ─────────────────────────────────────────────
@@ -3178,7 +3426,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
 <meta name="theme-color" content="#060a17">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<style>{CSS_STR}</style>
+<style>{CSS_STR}{XLINK_CSS}</style>
 </head>
 <body data-total="{len(analyses)}" data-usdjpy="{usdjpy}" data-open-ms="{meta['open_ms']}"
  data-close-ms="{meta['close_ms']}" data-mopen="{mkt_open}"
@@ -3186,6 +3434,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
 <div class="wrap">
   <header>
     <div class="brand">GLOBE ORACLE<small>US STOCK ORACLE</small></div>
+    <a class="xapp" href="https://kohei-omura.github.io/kabu-oracle/">🇯🇵 日本株は 株オラクル ›</a>
     <div class="meta">
       <span id="mkt" class="mkt closed">NY市場：—</span>
       <span id="pxasof">株価 {_esc(meta['asof_jst'])} 時点</span>
@@ -3196,6 +3445,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
   <nav id="nav" class="nav" aria-label="目次"></nav>
 
   {_keyed(hold_sec, "hold", "保有")}
+  <section class="sec" id="sec-xlink" data-key="xlink" data-nav="日米"><h2 class="find"><span>🌐 日米連動・日本株への影響</span><em id="xlcnt">株オラクルと連携</em></h2><div id="xlink" class="xl"><p class="xl-mut">読み込み中…</p></div></section>
   <section class="sec" id="sec-coach" data-key="coach" data-nav="成績"><h2 class="find"><span>🧭 取引コーチ（成績・資金管理）</span><em>端末内だけに保存</em></h2><div id="coach" class="coach"><p class="empty">読み込み中…</p></div></section>
 
   <section id="search-sec" class="sec">
@@ -3253,7 +3503,7 @@ def write_dashboard() -> Path:
         ma = None
     html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta, growth, hlevels, ma)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
-    (DOCS / "app.js").write_text(APP_JS, encoding="utf-8")
+    (DOCS / "app.js").write_text(APP_JS + XLINK_JS.replace("__SELF__", "globe"), encoding="utf-8")
     # 区切りの空白を詰め、検索キーはクライアント生成にして転送量を削減（1,800銘柄超で約500KB）
     (DOCS / "stocks.json").write_text(json.dumps(stocks, ensure_ascii=False, separators=(",", ":")),
                                       encoding="utf-8")
@@ -3263,6 +3513,7 @@ def write_dashboard() -> Path:
                 "list": [{"c": x["c"], "n": x["n"], "mcap": x["mcap"], "crit": x["crit"],
                           "score": x["score"], "status": x.get("status", "OK")} for x in cands]}
     (CANDIDATES_FILE).write_text(json.dumps(cand_out, ensure_ascii=False), encoding="utf-8")
+    _write_holdings_json(holdings, {a.code: a for a in analyses}, hlevels)
     (DOCS / "manifest.json").write_text(_manifest(), encoding="utf-8")
     _gen_icons()
     # 初回 prices も生成（開場前でも指数を出す）
@@ -3271,6 +3522,28 @@ def write_dashboard() -> Path:
     except Exception as e:
         print(f"[globe] 初回prices失敗: {e}", file=sys.stderr)
     return DOCS / "index.html"
+
+
+def _write_holdings_json(holdings: list[dict], amap: dict, hlevels: dict | None) -> None:
+    """保有銘柄を docs/holdings.json に書く（株オラクルの「日米の保有まとめ」が読む）。
+    利確・損切は保有カードと同じ優先順（手動 → 買値基準の固定値 → 汎用）。失敗してもダッシュボードは止めない。"""
+    try:
+        items = []
+        for h in holdings:
+            code = h.get("code")
+            if not code:
+                continue
+            a = amap.get(code)
+            avg = h.get("avg") or 0
+            lv = (hlevels or {}).get(code) or (_anchored_levels(avg, a) if a else None) or {}
+            items.append({"c": code, "n": a.name if a else "", "buy": avg or None,
+                          "tgt": h.get("tgt") or lv.get("tgt") or (a.tgt if a else None),
+                          "stp": h.get("stp") or lv.get("stp") or (a.stp if a else None),
+                          "qty": h.get("qty") or 0, "p": a.price if a else None})
+        out = {"asof": datetime.now(tz=JST).strftime("%Y-%m-%d %H:%M"), "ccy": "USD", "items": items}
+        (DOCS / "holdings.json").write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[globe] holdings.json 書き込み失敗: {e}", file=sys.stderr)
 
 
 def write_prices() -> dict:
@@ -3304,7 +3577,9 @@ def write_prices() -> dict:
             print(f"[globe] prices一括取得失敗: {e}", file=sys.stderr)
 
     idx = {}
-    for key, tk in [("SP500", "^GSPC"), ("NASDAQ", "^IXIC"), ("DOW", "^DJI"), ("USDJPY", "JPY=X")]:
+    # SOX・米10年金利は株オラクル（日本株）の日米連動判定にも使う（ヘッダーのタイルは従来の4つのまま）
+    for key, tk in [("SP500", "^GSPC"), ("NASDAQ", "^IXIC"), ("DOW", "^DJI"), ("USDJPY", "JPY=X"),
+                    ("SOX", "^SOX"), ("US10Y", "^TNX")]:
         p, chg = _fetch_quote(tk)
         if p is not None:
             idx[key] = {"price": p, "chg": chg if chg is not None else 0.0}
