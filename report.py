@@ -44,6 +44,7 @@ warnings.filterwarnings("ignore", message=r".*inplace keyword.*")
 JST = timezone(timedelta(hours=9))
 ET = ZoneInfo("America/New_York") if ZoneInfo else timezone(timedelta(hours=-5))
 DOCS = Path("docs")
+XMARKET_JS = Path(__file__).resolve().parent / "xmarket.js"   # 株×FX連動（4アプリ共通ファイル）
 DOCS.mkdir(exist_ok=True)
 
 WATCH_FALLBACK: list[str] = []  # クライアント側 localStorage 管理（サーバーは空でOK）
@@ -3446,6 +3447,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
 
   {_keyed(hold_sec, "hold", "保有")}
   <section class="sec" id="sec-xlink" data-key="xlink" data-nav="日米"><h2 class="find"><span>🌐 日米連動・日本株への影響</span><em id="xlcnt">株オラクルと連携</em></h2><div id="xlink" class="xl"><p class="xl-mut">読み込み中…</p></div></section>
+  <section class="sec" id="sec-xmarket" data-key="xmarket" data-nav="株×FX"><h2 class="find"><span>💱 株×FX連動・為替の影響</span><em id="xmcnt">FX Navi・Carry Navi と連携</em></h2><div id="xmarket" data-app="globe"><p class="xl-mut">読み込み中…</p></div></section>
   <section class="sec" id="sec-coach" data-key="coach" data-nav="成績"><h2 class="find"><span>🧭 取引コーチ（成績・資金管理）</span><em>端末内だけに保存</em></h2><div id="coach" class="coach"><p class="empty">読み込み中…</p></div></section>
 
   <section id="search-sec" class="sec">
@@ -3468,6 +3470,7 @@ def build_dashboard(analyses: list[Analysis], meta: dict, usdjpy: float,
 </div>
 <script>window.__SHOWN__={json.dumps(shown)};</script>
 <script src="app.js?v={ver}" defer></script>
+<script src="xmarket.js?v={ver}" defer></script>
 </body>
 </html>"""
 
@@ -3504,6 +3507,10 @@ def write_dashboard() -> Path:
     html, stocks = build_dashboard(analyses, meta, usdjpy, holdings, cands, cmeta, growth, hlevels, ma)
     (DOCS / "index.html").write_text(html, encoding="utf-8")
     (DOCS / "app.js").write_text(APP_JS + XLINK_JS.replace("__SELF__", "globe"), encoding="utf-8")
+    try:    # 株×FX連動（株オラクル・FX Navi・Carry Navi と共通の xmarket.js をそのまま公開する）
+        (DOCS / "xmarket.js").write_text(XMARKET_JS.read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception as e:
+        print(f"[globe] xmarket.js の書き出し失敗: {e}", file=sys.stderr)
     # 区切りの空白を詰め、検索キーはクライアント生成にして転送量を削減（1,800銘柄超で約500KB）
     (DOCS / "stocks.json").write_text(json.dumps(stocks, ensure_ascii=False, separators=(",", ":")),
                                       encoding="utf-8")
